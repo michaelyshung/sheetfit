@@ -2,7 +2,9 @@
 
 Turn phone photos of sheet music into clean, straight, print-ready pages.
 
-![before and after](docs/before_after.png)
+![A phone photo of a curled book page (left) and the straightened, cleaned Letter page sheetfit makes from it (right)](docs/before_after.png)
+
+*Real example: a phone photo of a page from a bound book, and the output.*
 
 `sheetfit` takes photos or scans of sheet music (including pages photographed
 straight out of a bound book) and produces a multi-page PDF where every page is:
