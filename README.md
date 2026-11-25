@@ -2,7 +2,7 @@
 
 Turn phone photos of sheet music into clean, straight, print-ready pages.
 
-![A phone photo of a curled book page (left) and the straightened, cleaned Letter page sheetfit makes from it (right)](docs/before_after.png)
+![A phone photo of a curled book page (left) and the straightened, cleaned Letter page sheetfit makes from it (right)](docs/example_waltz.png)
 
 *Real example: a phone photo of a page from a bound book, and the output.*
 
