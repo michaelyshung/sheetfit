@@ -1,0 +1,112 @@
+# sheetfit
+
+Turn phone photos of sheet music into clean, straight, print-ready pages.
+
+![before and after](docs/before_after.png)
+
+`sheetfit` takes photos or scans of sheet music (including pages photographed
+straight out of a bound book) and produces a multi-page PDF where every page is:
+
+- **straightened**: tilt is detected from the staff lines
+- **dewarped**: staves that curve towards the book's spine are flattened
+- **cleaned**: shadows, lighting gradients, tinted paper, highlighter,
+  coloured banners, page edges, neighbouring pages and the table are removed
+- **high contrast**: background to pure white, faded/grey notation to black,
+  so it prints crisply on a monochrome printer
+- **fitted** to Letter, A4 or Legal with consistent margins
+
+It is a single command, works on a whole folder at once, and only depends on
+`numpy` and `Pillow`.
+
+## Install
+
+```bash
+pip install git+https://github.com/michaelyshung/sheetfit
+```
+
+or, from a clone:
+
+```bash
+pip install .
+```
+
+## Use
+
+```bash
+# a folder of photos (processed in file-name order) -> one PDF
+sheetfit "photos/waltz/" -o waltz.pdf
+
+# specific files, A4, pure black & white, also save PNG pages
+sheetfit p1.jpg p2.jpg p3.jpg -o out.pdf --paper a4 --bw --png-dir pages/
+```
+
+Without installing: `python -m sheetfit ...` from the `src/` directory.
+
+### Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `-o, --output FILE` | `sheets.pdf` | Combined PDF |
+| `--png-dir DIR` | | Also write one PNG per page |
+| `--paper letter\|a4\|legal` | `letter` | Page size |
+| `--dpi N` | `300` | Output resolution |
+| `--margin IN` | `0.4` | Page margin in inches |
+| `--orientation portrait\|landscape\|auto` | `portrait` | `auto` picks landscape for wide content |
+| `--align top\|center` | `top` | Vertical placement on the page |
+| `--bw` | off | Pure 1-bit black & white (smallest, sharpest on laser printers) |
+| `--bw-threshold N` | `170` | Cut-off for `--bw` |
+| `--white-point N` | `215` | Grey level at/above which becomes white. Lower = cleaner background |
+| `--darken G` | `1.8` | Gamma pushing greys toward black. Higher = bolder lines, `1` = off |
+| `--keep-color-marks` | off | Keep coloured pencil/pen annotations (as grey) instead of dropping colours |
+| `--rotate DEG` | `0` | Pre-rotate clockwise, e.g. `90` for sideways photos without EXIF |
+| `--max-angle DEG` | `10` | Largest tilt to search for |
+| `--no-flatten`, `--no-deskew`, `--no-crop`, `--no-dewarp` | | Skip a step |
+
+## How it works
+
+1. **Gray by brightest channel.** Black ink is dark in every RGB channel;
+   tinted paper, highlighter and coloured boxes are bright in at least one.
+   Taking the per-pixel maximum keeps the notation and drops the colours.
+2. **Flatten lighting.** Estimate the paper brightness everywhere (max filter
+   to erase ink, then blur) and divide it out, removing shadows and gradients.
+3. **Remove what isn't paper.** In the outer margins, columns/rows whose
+   *median* is dark or mid-grey can't contain music (music is mostly white
+   between staff lines), so page-edge shadows, the next page and the table are
+   blanked, along with thick dark blobs touching the border (curled corners).
+4. **Deskew.** Try rotation angles (coarse to fine, to 0.02°) and keep the one
+   where the horizontal ink profile is sharpest, i.e. staff lines are level.
+5. **Crop** to the largest block of ink, merging systems separated by gaps.
+6. **Dewarp.** Cut the page into vertical strips and horizontal bands. Walking
+   outward from the middle strip, cross-correlate each strip's staff-line
+   profile with its neighbour's to measure how far the lines drift up or down.
+   Fit a smooth surface `d(x, y)` (4th order across, quadratic down, so the top
+   and bottom can bend differently) and shift every pixel column by it. Safety
+   checks skip the step if there's too little music or the fit is poor.
+7. **Contrast for printing.** Levels (darkest ink → black, `--white-point` →
+   white) plus a gamma curve that pulls faded lines to black.
+8. **Fit** to the page within the margins and write the PDF/PNGs.
+
+## Tips and limitations
+
+- Photograph pages **flat-on and well lit**. Moderate tilt, shadows and book
+  curl are handled; strong perspective (shooting at a steep angle) is not yet
+  corrected.
+- Dewarping corrects vertical bending only. Very close to the spine the music
+  is also compressed sideways, and that isn't undone.
+- Low-resolution photos are upscaled to fill the page. Notation stays legible,
+  but small text gets soft. Use your camera's full resolution.
+- Non-music pages (e.g. a cover photo) are processed too but will look like a
+  high-contrast sketch. Leave them out of the folder if you don't want that.
+
+## Development
+
+```bash
+python -m unittest discover tests      # or: pytest
+```
+
+Tests build synthetic sheet-music photos (tilted, curled, on a table, with
+coloured paper) and check every step plus the CLI end to end.
+
+## License
+
+MIT
