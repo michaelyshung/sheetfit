@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Straighten, dewarp, clean and fit photos of sheet music to Letter/A4 pages for printing"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = ["numpy>=1.21", "Pillow>=9.1", "pillow-heif>=0.13"]
 keywords = ["sheet music", "deskew", "dewarp", "scan", "pdf", "printing"]
 classifiers = [
