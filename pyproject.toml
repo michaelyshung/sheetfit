@@ -36,3 +36,6 @@ version = { attr = "sheetfit.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"sheetfit.gui" = ["icon.png"]

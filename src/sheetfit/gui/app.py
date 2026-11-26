@@ -466,6 +466,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     app = QApplication.instance() or QApplication(argv)
     app.setApplicationName("sheetfit")
+    app.setDesktopFileName("sheetfit")  # Linux: match the .desktop file's icon
+    app.setWindowIcon(QIcon(str(Path(__file__).with_name("icon.png"))))
     app.setApplicationVersion(__version__)
     win = MainWindow()
     if len(argv) > 1:

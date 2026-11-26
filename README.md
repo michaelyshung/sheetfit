@@ -64,6 +64,21 @@ Projects save as `.sheetfit` files, which the command line can also render.
 
 ## Install
 
+### Download the app
+
+Installers are on the [Releases page](https://github.com/michaelyshung/sheetfit/releases).
+Each one includes both the app and the `sheetfit` command-line tool, with
+Python and everything else built in.
+
+| System | File | Notes |
+|---|---|---|
+| Windows 10/11 (64-bit) | `sheetfit-<version>-windows-setup.exe` | Installs without admin rights. Windows may say "Windows protected your PC" because the installer isn't code-signed: click **More info → Run anyway**. Tick "Add to PATH" to use `sheetfit` in a terminal. |
+| macOS 11+ (Apple silicon) | `sheetfit-<version>-macos-arm64.dmg` | Drag sheetfit to Applications. The app isn't notarized, so the first time macOS blocks it: open **System Settings → Privacy & Security** and click **Open Anyway**. Command line: `/Applications/sheetfit.app/Contents/MacOS/sheetfit`. |
+| macOS 11+ (Intel) | `sheetfit-<version>-macos-x86_64.dmg` | As above. |
+| Ubuntu 22.04+, Debian 12+, Mint 21+ | `sheetfit_<version>_amd64.deb` | `sudo apt install ./sheetfit_<version>_amd64.deb`, then find sheetfit in the app menu, or run `sheetfit-app` / `sheetfit`. |
+
+### With pip
+
 ```bash
 pip install git+https://github.com/michaelyshung/sheetfit            # command line only
 pip install "sheetfit[gui] @ git+https://github.com/michaelyshung/sheetfit"   # plus the app
@@ -81,6 +96,20 @@ Or, from a clone:
 
 ```bash
 pip install .
+```
+
+### Building the installers
+
+`.github/workflows/release.yml` builds all of them on GitHub (run it from
+the Actions tab, or push a `v*` tag to publish a release). Locally, on the
+system you're building for:
+
+```bash
+pip install ".[gui]" pyinstaller
+pyinstaller --noconfirm packaging/sheetfit.spec   # -> dist/sheetfit/ (dist/sheetfit.app on macOS)
+packaging/build_deb.sh                            # Linux -> dist/sheetfit_<version>_amd64.deb
+packaging/build_dmg.sh                            # macOS -> dist/sheetfit-<version>-macos-<arch>.dmg
+iscc /DAppVersion=<version> packaging\sheetfit.iss # Windows (Inno Setup 6) -> dist\...-setup.exe
 ```
 
 ## Use
