@@ -1,6 +1,6 @@
-"""sheetfit — straighten, clean, crop and fit photos/scans of sheet music to printable pages.
+"""Image operations for sheetfit (no state, no I/O).
 
-Pipeline per image:
+The pipeline (see pipeline.py) runs, per image:
   1. load, apply EXIF orientation, convert to gray by taking the brightest
      colour channel (drops tinted paper, highlighter, coloured banners)
   2. flatten lighting: divide by an estimated paper background, removing
@@ -8,31 +8,19 @@ Pipeline per image:
   3. blank page-edge shadows, neighbouring pages, curled corners and tables
   4. deskew: find the rotation that makes staff lines most horizontal
   5. crop to the music: largest block of ink, ignoring specks
-  6. dewarp: measure how staff lines bend across the page (page curl near a
-     book's spine) and shift each pixel column so they run straight
+  6. flatten page curl along guide lines that follow the staves (warp.py)
   7. boost contrast for monochrome printing: background to pure white,
      ink and faded lines to black
   8. measure staff-line spacing on every page (none = not music: kept as a
      plain photo) and scale pages so staff lines print the same size
   9. fit to the page (Letter, A4 or Legal) within margins
  10. write a multi-page PDF and/or one PNG per page
-
-Only needs numpy + Pillow.
-
-Usage:
-  sheetfit IMG [IMG ...] -o out.pdf
-  sheetfit photos/ -o book.pdf --png-dir pages/ --bw
 """
 from __future__ import annotations
-
-import argparse
-import sys
-from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
-from . import __version__
 
 PAPER_IN = {"letter": (8.5, 11.0), "a4": (8.27, 11.69), "legal": (8.5, 14.0)}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp", ".heic", ".heif"}
@@ -125,6 +113,8 @@ def _profile_score(mask_img: Image.Image, angle: float) -> float:
 
 def find_skew(gray: Image.Image, max_angle: float = 10.0) -> float:
     """Return the CCW rotation in degrees that levels the staff lines."""
+    if max_angle <= 0:
+        return 0.0
     small, _ = working_copy(gray, 1200)
     mask = Image.fromarray((ink_mask(small) * 255).astype(np.uint8))
     best = 0.0
@@ -247,13 +237,15 @@ def find_content_box(gray: Image.Image, gap_frac: float = 0.06,
     if rspan is None:
         return (0, 0, gray.width, gray.height)
     r0, r1 = rspan
-    # Pull in small, nearby lines of ink: page numbers, footers, titles.
-    near, small_h = int(h * 0.12), int(h * 0.04)
+    # Pull in small, nearby lines of ink: page numbers and footers below the
+    # music; above it only text-height lines (a title, a header), so a stray
+    # speck or dash near the top edge isn't mistaken for content.
+    near, small_h, text_h = int(h * 0.12), int(h * 0.04), max(3, int(h * 0.008))
     for a0, a1 in _runs(rows > 0.0005):
         a1 -= 1
         if a1 - a0 > small_h:
             continue
-        if 0 < r0 - a1 <= near:
+        if 0 < r0 - a1 <= near and a1 - a0 + 1 >= text_h:
             r0 = a0
         elif 0 < a0 - r1 <= near:
             r1 = a1
@@ -301,125 +293,6 @@ def staff_spacing(gray: Image.Image) -> float | None:
     return best + (0.5 * (l - r) / den if den < 0 else 0.0)
 
 
-# ---------------------------------------------------------------- dewarp
-def _band_shift(p: np.ndarray, q: np.ndarray, S: int) -> tuple[float, float]:
-    """Vertical shift s (subpixel) such that q[y + s] best matches p[y].
-
-    Returns (shift, confidence). Confidence is 0 when either profile is
-    nearly empty (no staff in this strip/band).
-    """
-    n = p.size
-    energy = min(p.std(), q.std())
-    if energy < 4.0:
-        return 0.0, 0.0
-    p = p - p.mean()
-    q = q - q.mean()
-    scores = np.array([np.dot(p[max(0, -s):n - max(0, s)], q[max(0, s):n - max(0, -s)])
-                       for s in range(-S, S + 1)])
-    k = int(np.argmax(scores))
-    sub = 0.0
-    if 0 < k < 2 * S:  # parabola through the peak for subpixel accuracy
-        l, c, r = scores[k - 1], scores[k], scores[k + 1]
-        den = l - 2 * c + r
-        if den < 0:
-            sub = 0.5 * (l - r) / den
-    elif k in (0, 2 * S):  # peak at the search limit: unreliable
-        return 0.0, 0.0
-    return k - S + sub, float(energy)
-
-
-def dewarp(gray: Image.Image, n_strips: int = 40, n_bands: int = 10,
-           deg_x: int = 4, deg_y: int = 2) -> tuple[Image.Image, float]:
-    """Straighten curved staff lines (page curl near a book's spine).
-
-    1. Cut the page into `n_strips` vertical strips and `n_bands` overlapping
-       horizontal bands; in each cell take the row-darkness profile.
-    2. Walking outward from the middle strip, find how far each strip's
-       profile is shifted vertically versus its neighbour (cross-correlation;
-       small steps, so staff lines can't be confused with their neighbours)
-       and accumulate: D(strip, band) = how far the music has drifted.
-    3. Fit a smooth surface d(x, y) = sum a_pq x^p y^q (deg 4 across the page,
-       quadratic down it, so top and bottom can bend differently -- the
-       "pinch").
-    4. Resample every pixel column: out(x, y) = in(x, y + d(x, y)).
-
-    Returns the new image and the largest displacement applied (pixels).
-    """
-    small, s = working_copy(gray, 1600)
-    a = 255.0 - np.asarray(small, dtype=np.float32)
-    a[a < 60] = 0  # ignore paper texture
-    h, w = a.shape
-
-    ink_cols = np.flatnonzero((a > 0).mean(axis=0) > 0.01)
-    if ink_cols.size < 0.3 * w:
-        return gray, 0.0
-    x0, x1 = int(ink_cols[0]), int(ink_cols[-1]) + 1
-    xe = np.linspace(x0, x1, n_strips + 1).astype(int)
-    prof = np.stack([a[:, xe[i]:xe[i + 1]].mean(axis=1) for i in range(n_strips)])
-
-    half = h / n_bands  # bands overlap by 50%
-    centers = np.linspace(half, h - half, n_bands)
-    S = max(2, round(h * 0.006))  # max drift between neighbouring strips
-
-    D = np.zeros((n_strips, n_bands))
-    W = np.zeros((n_strips, n_bands))
-    mid = n_strips // 2
-    for k, c in enumerate(centers):
-        y0, y1 = int(c - half), int(c + half)
-        ref_w = min(prof[mid, y0:y1].std(), 1e9)
-        W[mid, k] = ref_w if ref_w >= 4.0 else 0.0
-        for order in (range(mid + 1, n_strips), range(mid - 1, -1, -1)):
-            for j in order:
-                i = j - 1 if j > mid else j + 1  # neighbour closer to the middle
-                # follow the drift: compare at the neighbour's shifted window
-                off = int(round(D[i, k]))
-                ya, yb = max(0, y0 + off), min(h, y1 + off)
-                st, conf = _band_shift(prof[i, ya:yb], prof[j, ya:yb], S)
-                D[j, k] = D[i, k] + st
-                W[j, k] = min(W[i, k], conf) if conf else 0.0
-
-    if (W > 0).sum() < deg_x * deg_y * 3:
-        return gray, 0.0
-
-    # Fit the smooth surface. Coordinates normalised to [-1, 1].
-    xc = ((xe[:-1] + xe[1:]) / 2 - x0) / max(1, x1 - x0) * 2 - 1
-    yc = centers / h * 2 - 1
-    XX, YY = np.meshgrid(xc, yc, indexing="ij")
-    terms = [(p, q) for p in range(deg_x + 1) for q in range(deg_y + 1)]
-    A = np.stack([XX.ravel() ** p * YY.ravel() ** q for p, q in terms], axis=1)
-    sw = np.sqrt(W.ravel())
-    coef, *_ = np.linalg.lstsq(A * sw[:, None], D.ravel() * sw, rcond=None)
-
-    # Residual check: if the model doesn't explain the measurements, skip.
-    good = W.ravel() > 0
-    resid = np.abs(A[good] @ coef - D.ravel()[good])
-    if np.median(resid) > 1.5:
-        return gray, 0.0
-
-    # Evaluate at full resolution, column by column. Pad top and bottom with
-    # white first so content shifted towards an edge (e.g. a page number
-    # under a drooping corner) stays in frame; the caller re-crops.
-    pad = int(0.08 * gray.height)
-    g = np.asarray(ImageOps.expand(gray, (0, pad, 0, pad), fill=255), dtype=np.float32)
-    H, Wf = g.shape
-    Y = np.arange(H, dtype=np.float32)
-    yn = ((Y - pad) * s) / h * 2 - 1
-    xs = np.clip(((np.arange(Wf) * s) - x0) / max(1, x1 - x0) * 2 - 1, -1, 1)
-    out = np.empty_like(g)
-    max_d = 0.0
-    for x in range(Wf):
-        xp = xs[x]
-        d = np.zeros(H, dtype=np.float32)
-        for (p, q), cf in zip(terms, coef):
-            d += cf * xp ** p * yn ** q
-        d /= s  # working px -> full-res px
-        max_d = max(max_d, float(np.abs(d).max()))
-        out[:, x] = np.interp(Y + d, Y, g[:, x], left=255, right=255)
-    if max_d > 0.08 * gray.height:  # implausible -- don't trust it
-        return gray, 0.0
-    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)), max_d
-
-
 # ---------------------------------------------------------------- fit
 def _page_geometry(img: Image.Image, dpi: int, margin_in: float, orientation: str,
                    paper: str) -> tuple[int, int, int, float]:
@@ -433,170 +306,18 @@ def _page_geometry(img: Image.Image, dpi: int, margin_in: float, orientation: st
 
 
 def fit_to_page(img: Image.Image, dpi: int, margin_in: float, orientation: str,
-                align: str, paper: str = "letter", scale: float | None = None) -> Image.Image:
+                align: str, paper: str = "letter", scale: float | None = None,
+                offset_in: tuple[float, float] = (0.0, 0.0)) -> Image.Image:
+    """Place `img` on a blank page. Default: largest size that fits the
+    margins, centred horizontally, top- or centre-aligned. `scale` (output
+    px per image px) and `offset_in` (inches) override size and position.
+    """
     pw, ph, m, fit = _page_geometry(img, dpi, margin_in, orientation, paper)
-    scale = fit if scale is None else min(scale, fit)
+    scale = fit if scale is None else scale
     nw, nh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
     fitted = img.resize((nw, nh), Image.LANCZOS)
     page = Image.new("L", (pw, ph), 255)
-    x = (pw - nw) // 2
-    y = m if align == "top" else (ph - nh) // 2
+    x = (pw - nw) // 2 + round(offset_in[0] * dpi)
+    y = (m if align == "top" else (ph - nh) // 2) + round(offset_in[1] * dpi)
     page.paste(fitted, (x, y))
     return page
-
-
-# ---------------------------------------------------------------- pipeline
-def process(path: Path, args: argparse.Namespace) -> tuple[Image.Image | None, float | None]:
-    """Clean one photo. Returns (cropped grayscale page, staff spacing px).
-
-    Spacing is None for pages without staff lines (handled per --non-music;
-    the image is None when such a page is skipped).
-    """
-    with Image.open(path) as im:
-        img = ImageOps.exif_transpose(im)
-        img.load()
-    gray = to_gray(img, args.keep_color_marks)
-    if args.rotate:
-        gray = gray.rotate(-args.rotate, expand=True, fillcolor=255)
-        img = img.rotate(-args.rotate, expand=True, fillcolor="white")
-
-    raw = gray
-    if not args.no_flatten:
-        gray = flatten_lighting(gray)
-
-    if not args.no_crop:
-        gray = whiten_dark_edges(gray, raw)
-
-    angle = 0.0 if args.no_deskew else find_skew(gray, args.max_angle)
-    if angle:
-        gray = gray.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=255)
-    box = (0, 0, gray.width, gray.height) if args.no_crop else find_content_box(gray)
-    gray = gray.crop(box)
-
-    spacing = staff_spacing(gray)
-    if spacing is None and args.non_music != "music":
-        if args.non_music == "skip":
-            print(f"  {path.name}: no staff lines found -- skipped", file=sys.stderr)
-            return None, None
-        # photo mode: plain luminance, gentle auto-contrast, nothing else
-        print(f"  {path.name}: no staff lines found -- kept as a photo", file=sys.stderr)
-        return ImageOps.autocontrast(img.convert("L"), cutoff=0.5), None
-
-    warp = 0.0
-    if not args.no_dewarp:
-        gray, warp = dewarp(gray)
-        if warp and not args.no_crop:
-            gray = gray.crop(find_content_box(gray))
-            spacing = staff_spacing(gray) or spacing
-
-    gray = boost_contrast(gray, args.white_point, args.darken)
-    sp = f"{spacing:.1f}px" if spacing else "-"
-    print(f"  {path.name}: skew {angle:+.2f}°, dewarp {warp:.1f}px, staff spacing {sp}", file=sys.stderr)
-    return gray, spacing
-
-
-def layout_scales(imgs: list[Image.Image], spacings: list[float | None],
-                  args: argparse.Namespace) -> list[float | None]:
-    """Per-page scale so staff lines print at the same size on every page.
-
-    Each music page could be scaled up to `fit_i`; its printed staff spacing
-    would then be fit_i * spacing_i. Use the smallest of those for everyone,
-    so every page fits. Pages whose spacing looks misdetected (far smaller
-    than the rest) don't drag the others down; they just fit themselves.
-    """
-    if not args.uniform_scale:
-        return [None] * len(imgs)
-    fits = [_page_geometry(im, args.dpi, args.margin, args.orientation, args.paper)[3] for im in imgs]
-    printed = [f * s for f, s in zip(fits, spacings) if s]
-    if len(printed) < 2:
-        return [None] * len(imgs)
-    target = min(v for v in printed if v >= 0.75 * float(np.median(printed)))
-    return [target / s if s else None for s in spacings]
-
-
-def collect_inputs(items: list[str]) -> list[Path]:
-    out: list[Path] = []
-    for it in items:
-        p = Path(it)
-        if p.is_dir():
-            out += sorted(q for q in p.iterdir() if q.suffix.lower() in IMAGE_EXTS)
-        else:
-            out.append(p)
-    return out
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("inputs", nargs="+", help="image files or folders (processed in name order)")
-    ap.add_argument("-o", "--output", help="combined PDF to write (default: sheets.pdf unless --png-dir only)")
-    ap.add_argument("--png-dir", help="also write one PNG per page here")
-    ap.add_argument("--version", action="version", version=f"sheetfit {__version__}")
-    ap.add_argument("--paper", choices=sorted(PAPER_IN), default="letter")
-    ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--margin", type=float, default=0.4, help="page margin in inches (default 0.4)")
-    ap.add_argument("--orientation", choices=["portrait", "landscape", "auto"], default="portrait")
-    ap.add_argument("--align", choices=["top", "center"], default="top")
-    ap.add_argument("--max-angle", type=float, default=10.0, help="largest skew to search, degrees")
-    ap.add_argument("--rotate", type=float, default=0.0, help="pre-rotate clockwise by N degrees (e.g. 90)")
-    ap.add_argument("--white-point", type=int, default=215,
-                    help="grey level at/above which pixels become pure white (default 215; lower = cleaner background)")
-    ap.add_argument("--darken", type=float, default=1.8,
-                    help="gamma that pushes greys toward black (1 = off, default 1.8)")
-    ap.add_argument("--keep-color-marks", action="store_true",
-                    help="keep coloured annotations as grey instead of removing coloured backgrounds")
-    ap.add_argument("--bw", action="store_true",help="output pure black/white (smaller, crisper prints)")
-    ap.add_argument("--bw-threshold", type=int, default=170)
-    ap.add_argument("--no-flatten", action="store_true", help="skip lighting correction")
-    ap.add_argument("--no-deskew", action="store_true")
-    ap.add_argument("--no-dewarp", action="store_true", help="don't straighten curved staff lines")
-    ap.add_argument("--no-crop", action="store_true")
-    ap.add_argument("--no-uniform-scale", dest="uniform_scale", action="store_false",
-                    help="scale each page to fill the paper instead of matching staff size across pages")
-    ap.add_argument("--non-music", choices=["photo", "skip", "music"], default="photo",
-                    help="pages without staff lines (e.g. a cover): keep as a plain photo (default), "
-                         "skip them, or clean them like music")
-    args = ap.parse_args(argv)
-
-    paths = collect_inputs(args.inputs)
-    if not paths:
-        ap.error("no input images found")
-    if not args.output and not args.png_dir:
-        args.output = "sheets.pdf"
-
-    done: list[tuple[Path, Image.Image, float | None]] = []
-    for p in paths:
-        try:
-            img, spacing = process(p, args)
-        except Exception as e:  # keep going on a bad file
-            hint = ""
-            if p.suffix.lower() in (".heic", ".heif") and not HEIF_OK:
-                hint = " -- install HEIC support: pip install pillow-heif"
-            print(f"  {p}: FAILED ({e}){hint}", file=sys.stderr)
-            continue
-        if img is not None:
-            done.append((p, img, spacing))
-    if not done:
-        return 1
-
-    scales = layout_scales([d[1] for d in done], [d[2] for d in done], args)
-    pages = []
-    for (p, img, _), scale in zip(done, scales):
-        page = fit_to_page(img, args.dpi, args.margin, args.orientation, args.align,
-                           args.paper, scale)
-        if args.bw:
-            page = page.point(lambda v: 255 if v > args.bw_threshold else 0).convert("1")
-        pages.append(page)
-
-    if args.png_dir:
-        d = Path(args.png_dir)
-        d.mkdir(parents=True, exist_ok=True)
-        for i, ((p, _, _), page) in enumerate(zip(done, pages), 1):
-            page.save(d / f"{i:03d}_{p.stem}.png", dpi=(args.dpi, args.dpi))
-    if args.output:
-        pages[0].save(args.output, "PDF", resolution=args.dpi, save_all=True, append_images=pages[1:])
-        print(f"wrote {args.output} ({len(pages)} pages)", file=sys.stderr)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

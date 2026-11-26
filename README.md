@@ -113,6 +113,23 @@ Without installing: `python -m sheetfit ...` from the `src/` directory.
 - Matching staff size means a page with less music gets more white space
   rather than being blown up. Use `--no-uniform-scale` to fill every page.
 
+## Projects: save, tweak, re-render
+
+Every automatic decision (rotation, straighten angle, flatten guide lines,
+crop, staff size) is recorded per page in a *recipe*. Save them as a project,
+adjust anything, and render it again:
+
+```bash
+sheetfit photos/ --save-project waltz.sheetfit   # automatic recipes
+# ...edit waltz.sheetfit (JSON), or open it in the sheetfit app...
+sheetfit --project waltz.sheetfit -o waltz.pdf    # render exactly that
+```
+
+Page-curl flattening works along *guide lines*: one per staff, tracing where
+it really sits on the curled page, with a strength at each point. The
+automatic step draws the guides; editing them changes how the page is
+flattened.
+
 ## Development
 
 ```bash

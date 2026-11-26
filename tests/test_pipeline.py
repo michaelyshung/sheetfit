@@ -12,18 +12,19 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
+from sheetfit.cli import main
 from sheetfit.core import (
     HEIF_OK,
     PAPER_IN,
-    dewarp,
     find_content_box,
     find_skew,
     flatten_lighting,
-    main,
     staff_spacing,
     to_gray,
     whiten_dark_edges,
 )
+from sheetfit.recipe import Project
+from sheetfit.warp import flatten
 
 W, H = 1200, 1550
 
@@ -111,13 +112,14 @@ class TestSteps(unittest.TestCase):
     def test_dewarp_straightens_staves(self):
         flat = flatten_lighting(to_gray(music_page(), False))
         curled = curl(flat)
-        fixed, moved = dewarp(curled)
+        fixed, moved, guides = flatten(curled)
         self.assertGreater(moved, 5)
+        self.assertEqual(len(guides), 12)  # one per staff
         self.assertGreater(staff_sharpness(fixed), staff_sharpness(curled) * 1.2)
 
     def test_dewarp_leaves_flat_page_alone(self):
         flat = flatten_lighting(to_gray(music_page(), False))
-        _, moved = dewarp(flat)
+        _, moved, guides = flatten(flat)
         self.assertLess(moved, 3)
 
 
@@ -210,6 +212,86 @@ class TestCLI(unittest.TestCase):
             rc = main([str(td), "-o", str(td / "o.pdf"), "--dpi", "80"])
             self.assertEqual(rc, 0)
             self.assertTrue((td / "o.pdf").exists())
+
+
+class TestProject(unittest.TestCase):
+    """Recipes: save automatic decisions, edit them, render them back."""
+
+    def _pages(self, td: Path):
+        flat = flatten_lighting(to_gray(music_page(seed=4), False))
+        curl(flat).rotate(2, expand=True, fillcolor=245).save(td / "a.png")
+        music_page(seed=5).save(td / "b.png")
+
+    def _render(self, project: Path, out: Path) -> list[np.ndarray]:
+        main(["--project", str(project), "--png-dir", str(out)])
+        arrs = []
+        for f in sorted(out.glob("*.png")):
+            with Image.open(f) as im:
+                arrs.append(np.asarray(im.convert("L")))
+        return arrs
+
+    def test_round_trip_matches_direct_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._pages(td)
+            proj = td / "book.sheetfit"
+            main([str(td / "a.png"), str(td / "b.png"), "--png-dir", str(td / "direct"),
+                  "--dpi", "100", "--save-project", str(proj)])
+            direct = []
+            for f in sorted((td / "direct").glob("*.png")):
+                with Image.open(f) as im:
+                    direct.append(np.asarray(im.convert("L")))
+            again = self._render(proj, td / "again")
+            self.assertEqual(len(direct), 2)
+            for a, b in zip(direct, again):
+                self.assertEqual(a.shape, b.shape)
+                self.assertLess(np.abs(a.astype(int) - b.astype(int)).mean(), 0.5)
+
+    def test_project_records_auto_decisions(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._pages(td)
+            proj = td / "book.sheetfit"
+            main([str(td), "--save-project", str(proj), "--dpi", "100"])
+            p = Project.load(proj)
+            a, b = p.pages
+            self.assertAlmostEqual(a.angle, -2.0, delta=0.2)
+            self.assertGreaterEqual(len(a.guides), 10)   # curled page: guides along staves
+            self.assertEqual(b.guides, [])               # flat page: none
+            self.assertIsNotNone(a.crop)
+            self.assertEqual(Path(a.source), (td / "a.png").resolve())
+
+    def test_manual_edits_change_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._pages(td)
+            proj = td / "book.sheetfit"
+            main([str(td), "--save-project", str(proj), "--dpi", "100"])
+            base = self._render(proj, td / "base")
+
+            p = Project.load(proj)
+            p.pages[0].flatten_strength = 0.0          # turn flattening off
+            p.pages[1].scale_adjust = 0.8               # shrink page 2
+            p.pages[1].offset_in = [0.0, 1.0]           # and move it down an inch
+            p.save(proj)
+            edited = self._render(proj, td / "edited")
+
+            self.assertLess(staff_sharpness(Image.fromarray(edited[0])),
+                            staff_sharpness(Image.fromarray(base[0])) * 0.9)
+            top = lambda a: int(np.flatnonzero((a < 128).any(axis=1)).min())
+            self.assertAlmostEqual(top(edited[1]) - top(base[1]), 100, delta=6)
+            ink = lambda a: int((a < 128).any(axis=0).sum())
+            self.assertAlmostEqual(ink(edited[1]) / ink(base[1]), 0.8, delta=0.03)
+
+    def test_skipped_pages_stay_in_project(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            photo_page().save(td / "0cover.png")
+            music_page().save(td / "1music.png")
+            proj = td / "p.sheetfit"
+            main([str(td), "--non-music", "skip", "--save-project", str(proj), "--dpi", "80"])
+            p = Project.load(proj)
+            self.assertEqual([(q.kind, q.include) for q in p.pages], [("photo", False), ("music", True)])
 
 
 if __name__ == "__main__":

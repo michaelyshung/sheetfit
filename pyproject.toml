@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.scripts]
-sheetfit = "sheetfit.core:main"
+sheetfit = "sheetfit.cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "sheetfit.__version__" }
