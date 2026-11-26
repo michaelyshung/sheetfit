@@ -22,18 +22,37 @@ FORMAT_VERSION = 1
 class Guide:
     """A line that should be straight after flattening (normally a staff).
 
-    points: [[x, y], ...] in the straightened frame, sorted by x, tracing
-    where the line actually is on the (curled) page.
-    strengths: one per point; 1 = pull fully flat, 0 = leave alone, >1 =
-    overcorrect. Interpolated between points.
+    The editable form is a Bezier curve: `bezier` holds anchor, control,
+    control, anchor, ... ([P0, C1, C2, P1, C3, C4, P2, ...]) and
+    `anchor_strengths` one strength per anchor. It is resolved
+    (warp.resolve) into `points` + `strengths`, which the flattening engine
+    uses. A guide may also be just points (older projects).
+
+    Coordinates are in the straightened frame. Strength 1 = pull fully flat,
+    0 = leave alone, >1 = overcorrect; interpolated along the line.
     """
     points: list[list[float]]
     strengths: list[float] = field(default_factory=list)
+    bezier: list[list[float]] = field(default_factory=list)
+    anchor_strengths: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.points = sorted([[float(x), float(y)] for x, y in self.points])
-        if len(self.strengths) != len(self.points):
-            self.strengths = [1.0] * len(self.points)
+        pts = [[float(x), float(y)] for x, y in self.points]
+        if len(self.strengths) != len(pts):
+            self.strengths = [1.0] * len(pts)
+        order = sorted(range(len(pts)), key=lambda k: pts[k][0])
+        self.points = [pts[k] for k in order]
+        self.strengths = [float(self.strengths[k]) for k in order]
+        self.bezier = [[float(x), float(y)] for x, y in self.bezier]
+        n_anchors = (len(self.bezier) + 2) // 3 if self.bezier else 0
+        if len(self.anchor_strengths) != n_anchors:
+            self.anchor_strengths = [1.0] * n_anchors
+
+    def map(self, fn) -> "Guide":
+        """Apply fn(x, y) -> (x, y) to every coordinate (in place)."""
+        self.points = [list(fn(x, y)) for x, y in self.points]
+        self.bezier = [list(fn(x, y)) for x, y in self.bezier]
+        return self
 
 
 @dataclass

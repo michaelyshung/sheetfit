@@ -216,6 +216,11 @@ class MainWindow(QMainWindow):
             a.setShortcut(key)
             a.triggered.connect(fn)
             self.addAction(a)
+        self._stale: set[int] = set()
+        self._strip_timer = QTimer(self)
+        self._strip_timer.setSingleShot(True)
+        self._strip_timer.setInterval(300)
+        self._strip_timer.timeout.connect(self._refresh_strip)
         self.step = 1
         self.step_group.button(self.step).setChecked(True)
         self._pages_changed()
@@ -249,8 +254,15 @@ class MainWindow(QMainWindow):
         self._title()
 
     def _page_changed(self, i: int):
-        self.strip.update_page(i)
+        # thumbnails need the finished page; refresh them once edits pause
+        self._stale.add(i)
+        self._strip_timer.start()
         self._title()
+
+    def _refresh_strip(self):
+        for i in sorted(self._stale):
+            self.strip.update_page(i)
+        self._stale.clear()
 
     def _title(self):
         name = self.doc.path.name if self.doc.path else "Untitled"

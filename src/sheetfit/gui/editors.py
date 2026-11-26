@@ -6,8 +6,8 @@ import math
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QLineF, QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen
+from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, QTimer
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QPainterPath, QPainterPathStroker, QPen, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -21,15 +21,18 @@ from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from ..pipeline import box_to_abs
 from ..recipe import Guide
-from ..warp import spline
+from ..warp import _fit_cubic, bezier_sample, ensure_bezier, resolve, split_bezier
 from .canvas import ACCENT, CORAL, PURPLE, TEAL, Canvas, Handle, dashed, solid, to_pixmap
 from .model import Document, new_guide_at
 
@@ -136,6 +139,8 @@ class Editor(QWidget):
     step = ""
     title = ""
     has_auto = True
+    has_preview = True
+    PREVIEW_DPI = 60
 
     def __init__(self, doc: Document):
         super().__init__()
@@ -145,7 +150,29 @@ class Editor(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         self.canvas = Canvas()
-        lay.addWidget(self.canvas, 1)
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        self.split = split
+        self._sized = False
+        split.addWidget(self.canvas)
+        if self.has_preview:
+            pv = QWidget()
+            pl = QVBoxLayout(pv)
+            pl.setContentsMargins(0, 6, 0, 0)
+            cap = QLabel("  Result on paper")
+            cap.setStyleSheet("color: palette(placeholder-text); font-size: 11px;")
+            pl.addWidget(cap)
+            self.result_view = Canvas()
+            pl.addWidget(self.result_view, 1)
+            split.addWidget(pv)
+            pv.setMinimumWidth(180)
+            split.setStretchFactor(0, 3)
+            split.setStretchFactor(1, 2)
+            self._ptimer = QTimer(self)
+            self._ptimer.setSingleShot(True)
+            self._ptimer.setInterval(150)
+            self._ptimer.timeout.connect(self._render_preview)
+        lay.addWidget(split, 1)
         line = QFrame()
         line.setFrameShape(QFrame.VLine)
         line.setStyleSheet("color: palette(mid);")
@@ -166,6 +193,16 @@ class Editor(QWidget):
         self.form.addStretch(1)
         doc.page_changed.connect(self._page_changed)
         doc.settings_changed.connect(lambda: self.isVisible() and self.refresh())
+        if self.has_preview:
+            # other pages' edits can change this page's size (same staff size)
+            doc.page_changed.connect(lambda _: self.isVisible() and self._ptimer.start())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.has_preview and not self._sized and self.split.width() > 0:
+            w = self.split.width()
+            self.split.setSizes([int(w * 0.6), w - int(w * 0.6)])
+            self._sized = True
 
     # subclasses
     def build(self) -> None: ...
@@ -206,6 +243,28 @@ class Editor(QWidget):
                             + ("  ·  edited" if edited else "  ·  auto"))
         self.sync_side()
         self.draw(fit)
+        if self.has_preview:
+            self._ptimer.start()
+
+    def _render_preview(self) -> None:
+        """The finished page on paper, beside every editor."""
+        st = self.st
+        if st is None or st.preview is None:
+            self.result_view.set_image(None)
+            return
+        lay = self.doc.paper_layout(self.PREVIEW_DPI)
+        if self.i not in lay:
+            self.result_view.set_image(None)
+            return
+        img, pw, ph, x, y, nw, nh = lay[self.i]
+        page = Image.new("L", (pw, ph), 255)
+        page.paste(img.resize((nw, nh), Image.LANCZOS), (x, y))
+        s = self.doc.settings
+        if s.bw and st.recipe.kind == "music":
+            page = page.point(lambda v: 255 if v > s.bw_threshold else 0)
+        self.result_view.set_image(page)
+        self.result_view.clear_overlay()
+        self.result_view.scene().addItem(_rect(QRectF(0, 0, pw, ph), solid(QColor(0, 0, 0, 60), 1)))
 
     def auto(self) -> None:
         if self.ready:
@@ -267,7 +326,8 @@ class StraightenEditor(Editor):
 
     def build(self):
         self.form.addWidget(heading("Angle"))
-        self.angle = Slider(-10, 10, 0.05, "{:+.2f}°", on_commit=self._set_angle)
+        self.angle = Slider(-10, 10, 0.01, "{:+.2f}°", on_change=self._set_angle,
+                            on_commit=self._set_angle)
         self.form.addWidget(self.angle)
         self.form.addWidget(row(button("↺ 90°", lambda: self._quarter(-1)),
                                 button("↻ 90°", lambda: self._quarter(1))))
@@ -325,6 +385,30 @@ class StraightenEditor(Editor):
 
 
 # ---------------------------------------------------------------- 3 flatten
+class _GuidePath(QGraphicsPathItem):
+    """A guide's curve. Click to select the guide, double-click to add an
+    anchor there. Its hit area is wider than the drawn line."""
+
+    def __init__(self, editor, gi: int, hit: float):
+        super().__init__()
+        self.editor, self.gi, self.hit = editor, gi, hit
+        self.setCursor(Qt.PointingHandCursor)
+        self.setZValue(5)
+
+    def shape(self):
+        st = QPainterPathStroker()
+        st.setWidth(self.hit)
+        return st.createStroke(self.path())
+
+    def mousePressEvent(self, e):
+        self.editor.select(self.gi, None)
+        e.accept()
+
+    def mouseDoubleClickEvent(self, e):
+        self.editor.split_at(self.gi, e.scenePos())
+        e.accept()
+
+
 class FlattenEditor(Editor):
     step, title = "flatten", "Flatten"
 
@@ -332,29 +416,37 @@ class FlattenEditor(Editor):
         self.form.addWidget(heading("Overall strength"))
         self.overall = Slider(0, 150, 5, "{:.0f}%", on_commit=lambda v: self._commit(strength=v / 100))
         self.form.addWidget(self.overall)
-        self.form.addWidget(heading("Selected point"))
-        self.point = Slider(0, 150, 5, "{:.0f}%", on_change=self._point_strength,
+        self.form.addWidget(heading("Selected anchor strength"))
+        self.point = Slider(0, 150, 5, "{:.0f}%", on_change=self._anchor_strength,
                             on_commit=lambda v: self._commit())
         self.point.setEnabled(False)
         self.form.addWidget(self.point)
         self.add = QPushButton("+ Line")
         self.add.setCheckable(True)
-        self.form.addWidget(row(self.add, button("Delete line", self._delete)))
+        self.form.addWidget(row(self.add, button("Delete", self._delete)))
         self.result = QCheckBox("Show result")
         self.result.toggled.connect(lambda _: self.refresh())
         self.form.addWidget(self.result)
-        self.form.addWidget(note("Orange lines follow the staves. Drag points to reshape a line; "
-                                 "purple bars show how hard each point is pulled flat. "
-                                 "+ Line, then click where a staff isn't covered."))
+        self.form.addWidget(note(
+            "Each orange line follows a staff. Click a line to edit it: drag the "
+            "square anchors, and the round handles to bend it. Double-click the "
+            "line to add an anchor; Delete removes the selected anchor, or the "
+            "whole line. + Line, then click where a staff isn't covered."))
         self.canvas.clicked_empty.connect(self._clicked)
-        self.canvas.scene().selectionChanged.connect(self._selection)
-        self.items = []
-        self.guides: list[Guide] = []     # scene coordinates while editing
-        self.sel: tuple[int, int] | None = None
+        for key in (QKeySequence.Delete, QKeySequence(Qt.Key_Backspace)):
+            QShortcut(key, self, self._delete, context=Qt.WidgetWithChildrenShortcut)
+        self.bz: list[np.ndarray] = []      # per guide: control points, scene coords
+        self.astr: list[list[float]] = []   # per guide: anchor strengths
+        self.sg: int | None = None          # selected guide
+        self.sa: int | None = None          # selected anchor (index into anchors)
 
     def sync_side(self):
         self.overall.set(self.st.recipe.flatten_strength * 100)
+        self.point.setEnabled(self.sg is not None and self.sa is not None)
+        if self.sg is not None and self.sa is not None and self.sg < len(self.astr):
+            self.point.set(self.astr[self.sg][self.sa] * 100)
 
+    # ---- drawing
     def draw(self, fit):
         if self.result.isChecked():
             self.canvas.set_image(self.doc.stage(self.i, "flat"), keep_view=not fit)
@@ -362,97 +454,183 @@ class FlattenEditor(Editor):
         img = self.doc.stage(self.i, "straight")
         self.img = img
         self.canvas.set_image(img, keep_view=not fit)
-        self.guides = []
+        self.bz, self.astr = [], []
         for g in self.st.recipe.guides:
-            pts = [[p.x(), p.y()] for p in (self.to_scene(img, x, y) for x, y in g.points)]
-            self.guides.append(Guide(points=pts, strengths=list(g.strengths)))
-        self.items = []
-        sc = self.canvas.scene()
-        bar = 0.035 * img.height
-        for gi, g in enumerate(self.guides):
-            path = QGraphicsPathItem()
-            path.setPen(solid(CORAL, 2))
-            sc.addItem(path)
-            bars, handles = [], []
-            for pi, ((x, y), s) in enumerate(zip(g.points, g.strengths)):
-                b = QGraphicsLineItem(x, y, x, y - bar * s)
-                b.setPen(solid(PURPLE, 3))
-                sc.addItem(b)
-                h = Handle(x, y, CORAL, r=5, moved=lambda hd, pos, gi=gi, pi=pi: self._moved(gi, pi, pos),
-                           released=lambda hd: self._commit())
-                sc.addItem(h)
-                bars.append(b)
-                handles.append(h)
-            self.items.append((path, bars, handles))
+            ensure_bezier(g)
+            pts = [self.to_scene(img, x, y) for x, y in g.bezier]
+            self.bz.append(np.array([[p.x(), p.y()] for p in pts]))
+            self.astr.append(list(g.anchor_strengths))
+        if self.sg is not None and self.sg >= len(self.bz):
+            self.sg = self.sa = None
+        self.paths = []
+        hit = 0.012 * img.height
+        for gi in range(len(self.bz)):
+            p = _GuidePath(self, gi, hit)
+            self.canvas.scene().addItem(p)
+            self.paths.append(p)
             self._redraw_path(gi)
-        self._selection()
+        self._draw_handles()
+        self.sync_side()
 
     def _redraw_path(self, gi):
-        g = self.guides[gi]
-        p = np.asarray(g.points)
-        xs = np.linspace(p[0, 0], p[-1, 0], 80)
-        ys = spline(p[:, 0], p[:, 1], xs)
-        path = QPainterPath(QPointF(xs[0], ys[0]))
-        for x, y in zip(xs[1:], ys[1:]):
+        pts = bezier_sample(self.bz[gi], 24)
+        path = QPainterPath(QPointF(*pts[0]))
+        for x, y in pts[1:]:
             path.lineTo(x, y)
-        self.items[gi][0].setPath(path)
+        sel = gi == self.sg
+        self.paths[gi].setPen(solid(CORAL, 2.5 if sel else 1.2))
+        self.paths[gi].setPath(path)
 
-    def _moved(self, gi, pi, pos):
-        g = self.guides[gi]
-        # keep points in x order: clamp between neighbours
-        lo = g.points[pi - 1][0] + 2 if pi > 0 else -1e9
-        hi = g.points[pi + 1][0] - 2 if pi + 1 < len(g.points) else 1e9
-        x = min(max(pos.x(), lo), hi)
-        g.points[pi] = [x, pos.y()]
-        s = g.strengths[pi]
-        bar = 0.035 * self.img.height
-        self.items[gi][1][pi].setLine(x, pos.y(), x, pos.y() - bar * s)
-        self._redraw_path(gi)
-
-    def _selection(self):
-        self.sel = None
-        try:
-            for gi, (_, _, hs) in enumerate(self.items):
-                for pi, h in enumerate(hs):
-                    if h.isSelected():
-                        self.sel = (gi, pi)
-        except RuntimeError:  # items already removed
+    def _draw_handles(self):
+        self.handles = []   # (Handle, ctrl index)
+        self.extras = []    # handle lines and strength bars
+        if self.sg is None:
             return
-        self.point.setEnabled(self.sel is not None)
-        if self.sel:
-            gi, pi = self.sel
-            self.point.set(self.guides[gi].strengths[pi] * 100)
+        sc = self.canvas.scene()
+        c = self.bz[self.sg]
+        bar = 0.04 * self.img.height
+        for k in range(len(c)):
+            if k % 3 == 0:
+                s = self.astr[self.sg][k // 3]
+                b = QGraphicsLineItem(c[k][0], c[k][1], c[k][0], c[k][1] - bar * s)
+                b.setPen(solid(PURPLE, 3))
+                b.setZValue(6)
+                sc.addItem(b)
+                self.extras.append(("bar", k, b))
+                h = Handle(c[k][0], c[k][1], CORAL, r=6, square=True,
+                           moved=lambda hd, pos, k=k: self._moved(k, pos),
+                           released=lambda hd: self._commit())
+                h.picked = lambda k=k: self.select(self.sg, k // 3)
+            else:
+                a = k - 1 if k % 3 == 1 else k + 1
+                ln = QGraphicsLineItem(c[a][0], c[a][1], c[k][0], c[k][1])
+                ln.setPen(solid(QColor(120, 120, 120), 1))
+                ln.setZValue(6)
+                sc.addItem(ln)
+                self.extras.append(("line", k, ln))
+                h = Handle(c[k][0], c[k][1], QColor(110, 110, 110), r=4,
+                           moved=lambda hd, pos, k=k: self._moved(k, pos),
+                           released=lambda hd: self._commit())
+            sc.addItem(h)
+            self.handles.append((h, k))
+            if k % 3 == 0 and self.sa == k // 3:
+                h.setSelected(True)
 
-    def _point_strength(self, v):
-        if not self.sel:
+    def _sync_handles(self):
+        """Move handles, handle lines and bars to match self.bz (no callbacks)."""
+        c = self.bz[self.sg]
+        bar = 0.04 * self.img.height
+        for h, k in self.handles:
+            if h.pos() != QPointF(*c[k]):
+                h._moved, m = None, h._moved
+                h.setPos(*c[k])
+                h._moved = m
+        for kind, k, it in self.extras:
+            if kind == "bar":
+                s = self.astr[self.sg][k // 3]
+                it.setLine(c[k][0], c[k][1], c[k][0], c[k][1] - bar * s)
+            else:
+                a = k - 1 if k % 3 == 1 else k + 1
+                it.setLine(c[a][0], c[a][1], c[k][0], c[k][1])
+
+    # ---- editing
+    def select(self, gi, anchor):
+        if (gi, anchor) == (self.sg, self.sa):
             return
-        gi, pi = self.sel
-        self.guides[gi].strengths[pi] = v / 100
-        x, y = self.guides[gi].points[pi]
-        bar = 0.035 * self.img.height
-        self.items[gi][1][pi].setLine(x, y, x, y - bar * v / 100)
+        same_guide = gi == self.sg
+        self.sg, self.sa = gi, anchor
+        if same_guide:  # just a different anchor: update the panel, no redraw
+            self.sync_side()
+        else:           # redraw after the current mouse event has finished
+            QTimer.singleShot(0, self.refresh)
+
+    def _moved(self, k, pos):
+        c = self.bz[self.sg]
+        new = np.array([pos.x(), pos.y()])
+        if k % 3 == 0:  # anchor: carry its handles along
+            d = new - c[k]
+            for j in (k - 1, k, k + 1):
+                if 0 <= j < len(c):
+                    c[j] = c[j] + d
+            self.sa = k // 3
+        else:           # handle: mirror its partner round the anchor (smooth)
+            c[k] = new
+            a = k - 1 if k % 3 == 1 else k + 1
+            other = a - 1 if k % 3 == 1 else a + 1
+            if 0 <= other < len(c) and 0 < a < len(c) - 1:
+                v = c[a] - c[k]
+                n = np.hypot(*v)
+                if n > 0:
+                    c[other] = c[a] + v / n * np.hypot(*(c[other] - c[a]))
+        self._redraw_path(self.sg)
+        self._sync_handles()
+
+    def _anchor_strength(self, v):
+        if self.sg is None or self.sa is None:
+            return
+        self.astr[self.sg][self.sa] = v / 100
+        self._sync_handles()
+
+    def _guides(self) -> list[Guide]:
+        img = self.doc.stage(self.i, "straight")
+        out = []
+        for c, s in zip(self.bz, self.astr):
+            frame = [list(self.from_scene(img, QPointF(x, y))) for x, y in c]
+            out.append(resolve(Guide(points=[], bezier=frame, anchor_strengths=list(s))))
+        return out
 
     def _commit(self, strength: float | None = None):
         if not self.ready or self.result.isChecked():
             return
-        img = self.doc.stage(self.i, "straight")
-        guides = []
-        for g in self.guides:
-            pts = [list(self.from_scene(img, QPointF(x, y))) for x, y in g.points]
-            guides.append(Guide(points=pts, strengths=list(g.strengths)))
-        ch = {"guides": guides}
+        ch = {"guides": self._guides()}
         if strength is not None:
             ch["flatten_strength"] = strength
-        sel = self.sel
         self.doc.update(self.i, self.step, **ch)
-        if sel:  # keep the same point selected after the redraw
-            try:
-                self.items[sel[0]][2][sel[1]].setSelected(True)
-            except (IndexError, RuntimeError):
-                pass
+
+    def split_at(self, gi, pos: QPointF):
+        """Add an anchor on guide gi at the point nearest `pos`."""
+        if gi != self.sg:
+            return self.select(gi, None)
+        c = self.bz[gi]
+        best = (1e18, 0, 0.5)
+        for seg in range(len(c) // 3):
+            ts = np.linspace(0.02, 0.98, 97)
+            pts = np.array([_cubic_pt(c[3 * seg:3 * seg + 4], t) for t in ts])
+            d = np.hypot(pts[:, 0] - pos.x(), pts[:, 1] - pos.y())
+            j = int(np.argmin(d))
+            if d[j] < best[0]:
+                best = (d[j], seg, float(ts[j]))
+        _, seg, t = best
+        self.bz[gi] = np.array(split_bezier(c.tolist(), seg, t))
+        s = self.astr[gi]
+        self.astr[gi] = s[:seg + 1] + [(s[seg] + s[seg + 1]) / 2] + s[seg + 1:]
+        self.sa = seg + 1
+        self._commit()
+
+    def _delete(self):
+        if self.sg is None:
+            return
+        c, s = self.bz[self.sg], self.astr[self.sg]
+        n_anchors = len(s)
+        if self.sa is not None and 0 < self.sa < n_anchors - 1:
+            # remove an interior anchor: refit that stretch as one segment
+            a = self.sa
+            pts = bezier_sample(c[3 * (a - 1):3 * (a + 1) + 1], 24)
+            seg, _ = _fit_cubic(pts)
+            self.bz[self.sg] = np.vstack([c[:3 * (a - 1)], np.asarray(seg), c[3 * (a + 1) + 1:]])
+            del s[a]
+            self.sa = None
+        else:
+            del self.bz[self.sg], self.astr[self.sg]
+            self.sg = self.sa = None
+        self._commit()
 
     def _clicked(self, pos: QPointF):
-        if not self.add.isChecked() or not self.ready or self.result.isChecked():
+        if self.result.isChecked() or not self.ready:
+            return
+        if not self.add.isChecked():
+            if self.sg is not None:
+                self.select(None, None)
             return
         self.add.setChecked(False)
         img = self.doc.stage(self.i, "straight")
@@ -461,20 +639,16 @@ class FlattenEditor(Editor):
             x0, _, x1, _ = box_to_abs([v * self.st.f for v in r.crop], img.size)
         else:
             x0, x1 = 0.1 * img.width, 0.9 * img.width
-        self.guides.append(new_guide_at(pos.y(), x0, x1))
+        y = pos.y()
+        self.bz.append(np.array([[x0, y], [x0 + (x1 - x0) / 3, y], [x0 + 2 * (x1 - x0) / 3, y], [x1, y]]))
+        self.astr.append([1.0, 1.0])
+        self.sg, self.sa = len(self.bz) - 1, None
         self._commit()
 
-    def _delete(self):
-        if self.sel:
-            del self.guides[self.sel[0]]
-            self.sel = None
-            self._commit()
 
-    def keyPressEvent(self, e):
-        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-            self._delete()
-        else:
-            super().keyPressEvent(e)
+def _cubic_pt(c, t):
+    u = 1 - t
+    return u ** 3 * c[0] + 3 * u * u * t * c[1] + 3 * u * t * t * c[2] + t ** 3 * c[3]
 
 
 # ---------------------------------------------------------------- 4 crop
@@ -565,6 +739,7 @@ class _Movable(QGraphicsPixmapItem):
         self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemSendsGeometryChanges)
         self.setCursor(Qt.SizeAllCursor)
         self.setTransformationMode(Qt.SmoothTransformation)
+        self.setShapeMode(QGraphicsPixmapItem.BoundingRectShape)  # grab anywhere, not just ink
         self.on_move, self.on_release = on_move, on_release
 
     def itemChange(self, change, value):
@@ -582,9 +757,15 @@ class SizeEditor(Editor):
     DPI = 72
 
     def build(self):
-        self.form.addWidget(heading("Ghost of other pages"))
-        self.ghost = Segmented(["Previous", "All", "Off"], lambda _: self.refresh())
-        self.form.addWidget(self.ghost)
+        self.form.addWidget(heading("Ghost: pages to show behind this one"))
+        self.ghost_list = QListWidget()
+        self.ghost_list.setFixedHeight(130)
+        self.ghost_list.itemChanged.connect(self._ghost_toggled)
+        self.form.addWidget(self.ghost_list)
+        self.form.addWidget(row(button("Previous", lambda: self._ghost_preset("prev")),
+                                button("All music", lambda: self._ghost_preset("all")),
+                                button("None", lambda: self._ghost_preset("none"))))
+        self.ghost_sel = None   # set of PageState; None = previous music page
         self.form.addWidget(heading("Ghost opacity"))
         self.opacity = Slider(0, 100, 5, "{:.0f}%", on_commit=lambda _: self.refresh())
         self.opacity.set(40)
@@ -601,6 +782,46 @@ class SizeEditor(Editor):
 
     def sync_side(self):
         self.size_slider.set(self.st.recipe.scale_adjust * 100)
+        sel = self._ghost_set()
+        self.ghost_list.blockSignals(True)
+        self.ghost_list.clear()
+        for k, p in enumerate(self.doc.pages):
+            if k == self.i:
+                continue
+            label = f"{k + 1} · {p.name}" + ("  (photo)" if p.recipe.kind == "photo" else "")
+            it = QListWidgetItem(label)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if p in sel else Qt.Unchecked)
+            it.setData(Qt.UserRole, k)
+            self.ghost_list.addItem(it)
+        self.ghost_list.blockSignals(False)
+
+    def _ghost_set(self) -> set:
+        if self.ghost_sel is not None:
+            return {p for p in self.ghost_sel if p in self.doc.pages}
+        return self._preset("prev")
+
+    def _preset(self, which: str) -> set:
+        music = [k for k, p in enumerate(self.doc.pages)
+                 if k != self.i and p.recipe.kind == "music" and p.recipe.include]
+        if which == "all":
+            return {self.doc.pages[k] for k in music}
+        if which == "prev":
+            before = [k for k in music if k < self.i]
+            pick = before[-1:] or music[:1]
+            return {self.doc.pages[k] for k in pick}
+        return set()
+
+    def _ghost_preset(self, which: str):
+        self.ghost_sel = self._preset(which)
+        self.refresh()
+
+    def _ghost_toggled(self, it: QListWidgetItem):
+        sel = self._ghost_set()
+        p = self.doc.pages[it.data(Qt.UserRole)]
+        (sel.add if it.checkState() == Qt.Checked else sel.discard)(p)
+        self.ghost_sel = sel
+        self.refresh()
 
     def _set_size(self, v):
         if self.ready:
@@ -627,13 +848,8 @@ class SizeEditor(Editor):
         sc.addItem(_rect(QRectF(0, 0, pw, ph), solid(QColor(0, 0, 0, 60), 1)))
         sc.addItem(_rect(QRectF(m, m, pw - 2 * m, ph - 2 * m), dashed(QColor(0, 0, 0, 50), 1)))
         # ghosts
-        mode = self.ghost.current()
-        others = [k for k in lay if k != self.i]
-        if mode == 0:
-            prev = [k for k in others if k < self.i]
-            others = prev[-1:] or others[:1]
-        elif mode == 2:
-            others = []
+        sel = self._ghost_set()
+        others = [k for k in lay if k != self.i and self.doc.pages[k] in sel]
         self.ghost_tops = []
         for k in others:
             gimg, _, _, gx, gy, gw, gh = lay[k]
@@ -767,7 +983,7 @@ class ContrastEditor(Editor):
 
 # ---------------------------------------------------------------- 7 output
 class OutputEditor(Editor):
-    step, title, has_auto = "output", "Output", False
+    step, title, has_auto, has_preview = "output", "Output", False, False
     DPI = 90
 
     def build(self):

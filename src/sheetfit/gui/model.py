@@ -51,7 +51,7 @@ def scale_recipe(r: PageRecipe, f: float) -> PageRecipe:
     if s.crop:
         s.crop = [v * f for v in s.crop]
     for g in s.guides:
-        g.points = [[x * f, y * f] for x, y in g.points]
+        g.map(lambda x, y: (x * f, y * f))
     if s.staff_spacing:
         s.staff_spacing *= f
     return s
@@ -278,7 +278,7 @@ class Document(QObject):
         elif step == "flatten":
             g = auto_flatten_guides(self.stage(i, "straight"))
             for gd in g:
-                gd.points = [[x / f, y / f] for x, y in gd.points]
+                gd.map(lambda x, y: (x / f, y / f))
             self.update(i, step, guides=g, flatten_strength=1.0)
         elif step == "crop":
             c = auto_crop(self.stage(i, "flat"))

@@ -15,7 +15,7 @@ from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
-    from PySide6.QtCore import QPointF
+    from PySide6.QtCore import QPointF, Qt
     from PySide6.QtWidgets import QApplication
     HAVE_QT = True
 except ImportError:
@@ -98,32 +98,72 @@ class TestApp(unittest.TestCase):
         self.assertAlmostEqual(self.doc.pages[0].recipe.angle, before, delta=0.05)
         self.assertNotIn("straighten", self.doc.pages[0].recipe.edited)
 
-    def test_3_flatten_point_drag_and_strength(self):
+    def test_3_flatten_bezier_editing(self):
         ed = self.editor("flatten")
         st = self.doc.pages[0]
-        g0 = [list(p) for p in st.recipe.guides[0].points]
-        h = ed.items[0][2][4]          # middle point of the first guide
-        h.setPos(h.pos() + QPointF(0, 10))
-        ed._commit()
-        moved = st.recipe.guides[0].points[4]
-        self.assertAlmostEqual(moved[1] - g0[4][1], 10 / st.f, delta=0.6)
-        # strength of the selected point
-        ed.items[0][2][4].setSelected(True)
+        g0 = st.recipe.guides[0]
+        self.assertTrue(g0.bezier)                      # auto guides are Bezier curves
+        self.assertLessEqual(len(g0.anchor_strengths), 4)  # ...with few anchors
+        # click the first line: its handles appear
+        ed.select(0, None)
         self.app.processEvents()
-        ed.point.set(40)
-        ed._point_strength(40)
+        anchors = [h for h, k in ed.handles if k % 3 == 0]
+        self.assertEqual(len(anchors), len(g0.anchor_strengths))
+        # drag the last anchor down 12 px: its handle comes along
+        h, k = [(h, k) for h, k in ed.handles if k % 3 == 0][-1]
+        before = np.array(ed.bz[0][k - 1])
+        h.setPos(h.pos() + QPointF(0, 12))
+        self.assertAlmostEqual(ed.bz[0][k - 1][1] - before[1], 12, delta=0.01)
         ed._commit()
-        self.assertAlmostEqual(st.recipe.guides[0].strengths[4], 0.4)
-        # add a line, then delete it
-        n = len(st.recipe.guides)
+        self.app.processEvents()
+        g = st.recipe.guides[0]
+        end_before = g0.bezier[-1][1]
+        self.assertAlmostEqual(g.bezier[-1][1] - end_before, 12 / st.f, delta=0.5)
+        self.assertAlmostEqual(g.points[-1][1], g.bezier[-1][1], delta=0.01)  # resolved
+        # double-click the line: a new anchor, same shape
+        n = len(g.anchor_strengths)
+        pts = np.asarray(g.points)
+        mid = ed.to_scene(ed.img, *pts[len(pts) // 3])
+        ed.split_at(0, mid)
+        self.app.processEvents()
+        g2 = st.recipe.guides[0]
+        self.assertEqual(len(g2.anchor_strengths), n + 1)
+        p2 = np.asarray(g2.points)
+        xs = np.linspace(pts[0, 0], pts[-1, 0], 50)
+        same = np.abs(np.interp(xs, p2[:, 0], p2[:, 1]) - np.interp(xs, pts[:, 0], pts[:, 1]))
+        self.assertLess(same.max(), 0.5)       # shape unchanged by the split
+        # its strength, then delete it again
+        ed.select(0, ed.sa)
+        ed._anchor_strength(40)
+        ed._commit()
+        self.app.processEvents()
+        self.assertAlmostEqual(st.recipe.guides[0].anchor_strengths[ed.sa], 0.4)
+        ed._delete()
+        self.app.processEvents()
+        self.assertEqual(len(st.recipe.guides[0].anchor_strengths), n)
+        # + Line, then delete the whole line
+        total = len(st.recipe.guides)
         ed.add.setChecked(True)
         ed._clicked(QPointF(100, 30))
-        self.assertEqual(len(st.recipe.guides), n + 1)
-        ed.items[-1][2][0].setSelected(True)
         self.app.processEvents()
+        self.assertEqual(len(st.recipe.guides), total + 1)
+        ed.select(len(st.recipe.guides) - 1, None)
         ed._delete()
-        self.assertEqual(len(st.recipe.guides), n)
+        self.app.processEvents()
+        self.assertEqual(len(st.recipe.guides), total)
         self.doc.reset_step(0, "flatten")
+        self.app.processEvents()
+
+    def test_3b_straighten_slider_is_live(self):
+        ed = self.editor("straighten")
+        a0 = self.doc.pages[0].recipe.angle
+        ed.angle.s.setSliderDown(True)          # mid-drag
+        ed.angle.s.setValue(ed.angle.s.value() + 100)   # +1 degree
+        self.app.processEvents()
+        self.assertAlmostEqual(self.doc.pages[0].recipe.angle, a0 + 1, delta=0.01)
+        ed.angle.s.setSliderDown(False)
+        self.doc.reset_step(0, "straighten")
+        self.app.processEvents()
 
     def test_4_crop_corner(self):
         ed = self.editor("crop")
@@ -147,6 +187,25 @@ class TestApp(unittest.TestCase):
         self.assertLessEqual(abs(after[3] - before[3]), 1)                   # same x
         self.assertLessEqual(abs(after[4] - before[4]), 1)                   # same y
         self.doc.reset_step(1, "size")
+
+    def test_5b_size_grab_anywhere_and_ghost_list(self):
+        from PySide6.QtWidgets import QGraphicsPixmapItem
+        ed = self.editor("size", page=1)
+        self.assertEqual(ed.item.shapeMode(), QGraphicsPixmapItem.BoundingRectShape)
+        # default ghost: the previous music page
+        checked = [ed.ghost_list.item(k).data(256) for k in range(ed.ghost_list.count())
+                   if ed.ghost_list.item(k).checkState() == Qt.Checked]
+        self.assertEqual(checked, [0])
+        ed._ghost_preset("none")
+        self.app.processEvents()
+        self.assertEqual(ed._ghost_set(), set())
+        ed._ghost_preset("prev")
+
+    def test_5c_result_preview_everywhere(self):
+        for step in ("clean", "straighten", "flatten", "crop", "size", "contrast"):
+            ed = self.editor(step)
+            ed._render_preview()
+            self.assertFalse(ed.result_view.pix.pixmap().isNull(), step)
 
     def test_6_export_matches_cli_project(self):
         from sheetfit.cli import main

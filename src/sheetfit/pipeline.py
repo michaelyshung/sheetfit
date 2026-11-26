@@ -44,7 +44,7 @@ def box_to_abs(box, size) -> tuple[int, int, int, int]:
 
 def _shift_guides(guides, dx: float, dy: float):
     for g in guides:
-        g.points = [[x + dx, y + dy] for x, y in g.points]
+        g.map(lambda x, y: (x + dx, y + dy))
     return guides
 
 

@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -38,13 +38,21 @@ def to_pixmap(img: Image.Image) -> QPixmap:
     return QPixmap.fromImage(to_qimage(img))
 
 
-class Handle(QGraphicsEllipseItem):
-    """A draggable dot. Calls `moved(handle, pos)` while dragging and
-    `released(handle)` when let go. Stays the same size on screen."""
+class Handle(QGraphicsPathItem):
+    """A draggable dot (or square). Calls `moved(handle, pos)` while
+    dragging, `picked()` when pressed and `released(handle)` when let go.
+    Stays the same size on screen."""
 
     def __init__(self, x: float, y: float, color: QColor = ACCENT, r: float = 6,
-                 moved=None, released=None):
-        super().__init__(-r, -r, 2 * r, 2 * r)
+                 moved=None, released=None, square: bool = False):
+        super().__init__()
+        path = QPainterPath()
+        if square:
+            path.addRect(-r, -r, 2 * r, 2 * r)
+        else:
+            path.addEllipse(-r, -r, 2 * r, 2 * r)
+        self.setPath(path)
+        self.picked = None
         self.setPos(x, y)
         self.setBrush(QBrush(QColor("white")))
         self.setPen(QPen(color, 2))
@@ -64,10 +72,17 @@ class Handle(QGraphicsEllipseItem):
             self.setBrush(QBrush(self.pen().color() if value else QColor("white")))
         return super().itemChange(change, value)
 
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        if self.picked:
+            self.picked()
+
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
         if self._released:
-            self._released(self)
+            # after this event returns: the callback may redraw (and delete us)
+            cb = self._released
+            QTimer.singleShot(0, lambda: cb(self))
 
 
 class Canvas(QGraphicsView):

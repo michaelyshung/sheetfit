@@ -36,15 +36,17 @@ with the automatic result; change only what needs it:
 
 1. **Clean**: keep or drop coloured markings, lighting and edge cleanup
 2. **Straighten**: angle slider, 90° turns, or drag a guide onto any staff line
-3. **Flatten**: orange guide lines follow each staff; drag points to reshape,
-   set how hard each point is pulled flat, add or delete lines
+3. **Flatten**: an orange Bezier curve follows each staff. Click one to edit
+   it: drag anchors and handles, double-click to add an anchor, set how hard
+   each anchor is pulled flat, add or delete lines
 4. **Crop**: drag the corners
 5. **Size and position**: drag and resize the music on the paper, with a ghost
-   of the other pages behind it to keep everything lined up
+   of the pages you pick behind it to keep everything lined up
 6. **Contrast**: clean background, darken lines, black and white
 7. **Output**: paper, margins, then save a PDF or print
 
-Every editor has an **Auto** button to undo your changes for that step.
+Every editor shows the finished page on paper beside it, and has an **Auto**
+button to undo your changes for that step.
 Projects save as `.sheetfit` files, which the command line can also render.
 
 ## Install

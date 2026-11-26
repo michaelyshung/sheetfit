@@ -43,6 +43,109 @@ def spline(xs: np.ndarray, ys: np.ndarray, xq: np.ndarray) -> np.ndarray:
             + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h * m[i + 1])
 
 
+# ---------------------------------------------------------------- Bezier
+def _cubic(p0, c1, c2, p1, t):
+    t = np.asarray(t, dtype=np.float64)[:, None]
+    u = 1 - t
+    return u ** 3 * p0 + 3 * u * u * t * c1 + 3 * u * t * t * c2 + t ** 3 * p1
+
+
+def bezier_sample(ctrl, per_segment: int = 16) -> np.ndarray:
+    """Points along a Bezier path [P0, C1, C2, P1, C3, C4, P2, ...]."""
+    c = np.asarray(ctrl, dtype=np.float64)
+    out = []
+    for k in range(0, len(c) - 1, 3):
+        ts = np.linspace(0, 1, per_segment, endpoint=False)
+        out.append(_cubic(c[k], c[k + 1], c[k + 2], c[k + 3], ts))
+    out.append(c[-1:])
+    return np.vstack(out)
+
+
+def _fit_cubic(pts: np.ndarray):
+    """Least-squares cubic through pts with the end points fixed.
+    Returns ([P0, C1, C2, P1], max error)."""
+    p0, p1 = pts[0], pts[-1]
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
+    t = d / d[-1] if d[-1] > 0 else np.linspace(0, 1, len(pts))
+    u = 1 - t
+    b0, b1, b2, b3 = u ** 3, 3 * u * u * t, 3 * u * t * t, t ** 3
+    A = np.stack([b1, b2], axis=1)
+    rhs = pts - b0[:, None] * p0 - b3[:, None] * p1
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    c1, c2 = sol
+    err = np.hypot(*(A @ sol + b0[:, None] * p0 + b3[:, None] * p1 - pts).T).max()
+    return [p0, c1, c2, p1], float(err)
+
+
+def fit_bezier(points, tol: float, max_segments: int = 4) -> list[list[float]]:
+    """Fewest-segment smooth Bezier path through `points` (sorted by x)
+    within `tol`. Interior anchors get collinear handles (no kinks)."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 2:
+        return [list(p) for p in pts]
+    segs = 1
+    while True:
+        cuts = np.linspace(0, len(pts) - 1, segs + 1).round().astype(int)
+        parts, worst = [], 0.0
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            seg, err = _fit_cubic(pts[a:b + 1]) if b - a >= 3 else (
+                [pts[a], pts[a] + (pts[b] - pts[a]) / 3, pts[a] + 2 * (pts[b] - pts[a]) / 3, pts[b]], 0.0)
+            parts.append(seg)
+            worst = max(worst, err)
+        if worst <= tol or segs >= max_segments:
+            break
+        segs += 1
+    ctrl = [parts[0][0]]
+    for seg in parts:
+        ctrl += [seg[1], seg[2], seg[3]]
+    ctrl = np.asarray(ctrl)
+    for k in range(3, len(ctrl) - 1, 3):  # smooth the joints
+        a, ci, co = ctrl[k], ctrl[k - 1], ctrl[k + 1]
+        v = (co - a) - (ci - a)
+        n = np.hypot(*v)
+        if n > 0:
+            v /= n
+            ctrl[k - 1] = a - v * np.hypot(*(ci - a))
+            ctrl[k + 1] = a + v * np.hypot(*(co - a))
+    return ctrl.tolist()
+
+
+def split_bezier(ctrl, seg: int, t: float) -> list[list[float]]:
+    """Insert an anchor in segment `seg` at parameter t (de Casteljau);
+    the curve's shape doesn't change."""
+    c = [np.asarray(p, dtype=np.float64) for p in ctrl]
+    p0, c1, c2, p1 = c[3 * seg:3 * seg + 4]
+    a, b, cc = p0 + (c1 - p0) * t, c1 + (c2 - c1) * t, c2 + (p1 - c2) * t
+    d, e = a + (b - a) * t, b + (cc - b) * t
+    m = d + (e - d) * t
+    new = c[:3 * seg] + [p0, a, d, m, e, cc, p1] + c[3 * seg + 4:]
+    return [list(map(float, p)) for p in new]
+
+
+def resolve(g: Guide, per_segment: int = 16) -> Guide:
+    """Fill g.points / g.strengths from its Bezier form (in place)."""
+    if not g.bezier:
+        return g
+    pts = bezier_sample(g.bezier, per_segment)
+    ax = np.asarray(g.bezier, dtype=np.float64)[0::3, 0]
+    order = np.argsort(ax)
+    s = np.interp(pts[:, 0], ax[order], np.asarray(g.anchor_strengths, dtype=np.float64)[order])
+    k = np.argsort(pts[:, 0], kind="stable")
+    g.points = pts[k].tolist()
+    g.strengths = s[k].tolist()
+    return g
+
+
+def ensure_bezier(g: Guide, tol: float = 1.0) -> Guide:
+    """Give a points-only guide (older projects) a Bezier form."""
+    if not g.bezier and len(g.points) >= 2:
+        g.bezier = fit_bezier(g.points, tol)
+        ax = np.asarray(g.bezier)[0::3, 0]
+        p = np.asarray(g.points)
+        g.anchor_strengths = np.interp(ax, p[:, 0], g.strengths).tolist()
+    return g
+
+
 def guide_target(g: Guide) -> float:
     """Height the guide is flattened to: where it sits at the middle of its span."""
     p = np.asarray(g.points)
@@ -148,7 +251,7 @@ def _staff_rows(profile: np.ndarray, spacing: float) -> list[float]:
 
 
 def auto_guides(gray: Image.Image, n_strips: int = 40, n_bands: int = 10,
-                deg_x: int = 4, deg_y: int = 2, n_points: int = 9) -> list[Guide]:
+                deg_x: int = 4, deg_y: int = 2, n_points: int = 33) -> list[Guide]:
     """Measure page curl from the staff lines and return guide lines.
 
     1. Cut the page into vertical strips and overlapping horizontal bands.
@@ -157,7 +260,8 @@ def auto_guides(gray: Image.Image, n_strips: int = 40, n_bands: int = 10,
        be mistaken for their neighbours) and accumulate the drift.
     3. Fit a smooth surface to the drift (deg 4 across, quadratic down).
     4. Find the staves in the middle strip and lay one guide along each,
-       following the surface; `n_points` editable points per guide.
+       following the surface, as the fewest Bezier segments that stay within
+       a third of a pixel (usually 1-2 segments: easy to edit by hand).
 
     Coordinates are relative to the centre of `gray`. Returns [] when the
     page is flat or the measurement can't be trusted.
@@ -227,7 +331,8 @@ def auto_guides(gray: Image.Image, n_strips: int = 40, n_bands: int = 10,
         max_shift = max(max_shift, float(np.abs(dy).max()))
         pts = [[(x / s) - gray.width / 2, ((r + d) / s) - gray.height / 2]
                for x, d in zip(xs_px, dy)]
-        guides.append(Guide(points=pts))
+        g = Guide(points=[], bezier=fit_bezier(pts, tol=0.3 / s))
+        guides.append(resolve(g))
     if max_shift < 0.5 or max_shift / s > 0.08 * gray.height:
         return []  # flat page, or implausibly strong curl
     return guides
