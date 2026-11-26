@@ -55,7 +55,14 @@ pip install "sheetfit[gui] @ git+https://github.com/michaelyshung/sheetfit"   # 
 ```
 
 The command-line version stays lightweight (numpy, Pillow, pillow-heif);
-the app adds PySide6. Or, from a clone:
+the app adds PySide6. On Linux the app also needs one system library that
+Qt doesn't bundle:
+
+```bash
+sudo apt install libxcb-cursor0
+```
+
+Or, from a clone:
 
 ```bash
 pip install .
