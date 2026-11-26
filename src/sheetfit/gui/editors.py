@@ -54,8 +54,9 @@ def note(text: str) -> QLabel:
 
 
 class Slider(QWidget):
-    """Float slider with a value readout. on_change(v) while moving,
-    on_commit(v) on release (or keyboard change)."""
+    """Float slider with a value readout. Applies live: on_change(v) and
+    then on_commit(v) run at every increment while dragging (undo groups
+    a whole drag into one step)."""
 
     def __init__(self, lo: float, hi: float, step: float, fmt: str, on_change=None, on_commit=None):
         super().__init__()
@@ -72,7 +73,6 @@ class Slider(QWidget):
         self._quiet = False
         self.on_change, self.on_commit = on_change, on_commit
         self.s.valueChanged.connect(self._changed)
-        self.s.sliderReleased.connect(lambda: self.on_commit and self.on_commit(self.value()))
 
     def value(self) -> float:
         return self.s.value() * self.step
@@ -90,7 +90,7 @@ class Slider(QWidget):
             return
         if self.on_change:
             self.on_change(v)
-        if not self.s.isSliderDown() and self.on_commit:
+        if self.on_commit:
             self.on_commit(v)
 
 
@@ -326,8 +326,7 @@ class StraightenEditor(Editor):
 
     def build(self):
         self.form.addWidget(heading("Angle"))
-        self.angle = Slider(-10, 10, 0.01, "{:+.2f}°", on_change=self._set_angle,
-                            on_commit=self._set_angle)
+        self.angle = Slider(-10, 10, 0.01, "{:+.2f}°", on_commit=self._set_angle)
         self.form.addWidget(self.angle)
         self.form.addWidget(row(button("↺ 90°", lambda: self._quarter(-1)),
                                 button("↻ 90°", lambda: self._quarter(1))))
@@ -829,9 +828,11 @@ class SizeEditor(Editor):
 
     def _all(self):
         r = self.st.recipe
-        for i, p in enumerate(self.doc.pages):
-            if i != self.i and p.recipe.kind == "music":
-                self.doc.update(i, self.step, scale_adjust=r.scale_adjust, offset_in=list(r.offset_in))
+        with self.doc.batch("Apply size to all pages"):  # one undo step
+            for i, p in enumerate(self.doc.pages):
+                if i != self.i and p.recipe.kind == "music":
+                    self.doc.update(i, self.step, scale_adjust=r.scale_adjust,
+                                    offset_in=list(r.offset_in))
 
     def draw(self, fit):
         lay = self.doc.paper_layout(self.DPI)

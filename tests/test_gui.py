@@ -207,6 +207,118 @@ class TestApp(unittest.TestCase):
             ed._render_preview()
             self.assertFalse(ed.result_view.pix.pixmap().isNull(), step)
 
+    def test_5d_sliders_apply_live(self):
+        ed = self.editor("contrast")
+        wp = self.doc.settings.white_point
+        ed.white.s.setSliderDown(True)
+        ed.white.s.setValue(ed.white.s.value() + 2)
+        self.app.processEvents()
+        self.assertNotEqual(self.doc.settings.white_point, wp)   # before release
+        ed.white.s.setSliderDown(False)
+        self.doc.undo()
+        self.assertEqual(self.doc.settings.white_point, wp)
+        ed = self.editor("size", page=1)
+        ed.size_slider.s.setSliderDown(True)
+        ed.size_slider.s.setValue(90)
+        self.app.processEvents()
+        self.assertAlmostEqual(self.doc.pages[1].recipe.scale_adjust, 0.9, delta=0.01)
+        ed.size_slider.s.setSliderDown(False)
+        self.doc.undo()
+        self.assertAlmostEqual(self.doc.pages[1].recipe.scale_adjust, 1.0, delta=0.001)
+
+    def test_7_undo_redo(self):
+        d = self.doc
+        a0 = d.pages[0].recipe.angle
+        d.update(0, "straighten", angle=a0 + 3)
+        self.assertTrue(d.can_undo)
+        d.undo()
+        self.assertAlmostEqual(d.pages[0].recipe.angle, a0)
+        self.assertTrue(d.can_redo)
+        d.redo()
+        self.assertAlmostEqual(d.pages[0].recipe.angle, a0 + 3)
+        d.undo()
+
+        # a slider drag is one step
+        ed = self.editor("straighten")
+        n = len(d._undo)
+        ed.angle.s.setSliderDown(True)
+        for k in range(1, 30):
+            ed.angle.s.setValue(ed.angle.s.value() + 5)
+        ed.angle.s.setSliderDown(False)
+        self.app.processEvents()
+        self.assertEqual(len(d._undo), n + 1)
+        d.undo()
+        self.assertAlmostEqual(d.pages[0].recipe.angle, a0, delta=0.01)
+
+        # removing and reordering pages
+        first, second = d.pages
+        d.remove(0)
+        self.assertEqual(d.pages, [second])
+        d.undo()
+        self.assertEqual(d.pages, [first, second])
+        d.move(0, 1)
+        self.assertEqual(d.pages, [second, first])
+        d.undo()
+        self.assertEqual(d.pages, [first, second])
+
+        # settings, and Apply to all as one step
+        d.set_settings(paper="a4")
+        d.undo()
+        self.assertEqual(d.settings.paper, "letter")
+        sz = self.editor("size", page=1)
+        d.update(1, "size", scale_adjust=0.8)
+        sz._all()
+        self.assertAlmostEqual(d.pages[0].recipe.scale_adjust, 0.8)
+        d.undo()
+        self.assertAlmostEqual(d.pages[0].recipe.scale_adjust, 1.0)
+        self.assertAlmostEqual(d.pages[1].recipe.scale_adjust, 0.8)
+        d.undo()
+        self.assertAlmostEqual(d.pages[1].recipe.scale_adjust, 1.0)
+
+        # a new edit clears redo
+        d.update(0, "crop", crop=[0, 0, 10, 10])
+        d.undo()
+        d.update(0, "straighten", angle=a0 + 1)
+        self.assertFalse(d.can_redo)
+        d.undo()
+        self.app.processEvents()
+
+    def test_8_history_panel(self):
+        d, panel = self.doc, self.win.history
+        origin, done, undone = d.history()
+        self.assertEqual(origin, "Start")
+        self.assertEqual(done[0], "Add 2 photos")
+        base = len(done)
+        a0 = d.pages[0].recipe.angle
+        d.update(0, "straighten", angle=a0 + 2)
+        d.update(1, "crop", crop=[-100, -100, 100, 100])
+        d.set_settings(white_point=200)
+        origin, done, undone = d.history()
+        self.assertEqual(done[-3:], ["Straighten · page 1", "Crop · page 2", "Clean background"])
+        self.assertEqual(panel.list.count(), 1 + len(done))
+        self.assertTrue(panel.list.item(len(done)).isSelected())   # current = last
+        d.undo()
+        self.assertEqual(d.history()[2], ["Clean background"])     # greyed, redoable
+        self.assertTrue(panel.list.item(len(done) - 1).isSelected())
+        # click the row before the straighten step: two more steps undone at once
+        panel.list.itemClicked.emit(panel.list.item(base))
+        self.app.processEvents()
+        self.assertAlmostEqual(d.pages[0].recipe.angle, a0)
+        self.assertEqual(len(d.history()[1]), base)
+        self.assertEqual(len(d.history()[2]), 3)
+        # and forward again to the end
+        panel.list.itemClicked.emit(panel.list.item(panel.list.count() - 1))
+        self.app.processEvents()
+        self.assertEqual(d.settings.white_point, 200)
+        self.assertAlmostEqual(d.pages[0].recipe.angle, a0 + 2)
+        # a new edit after undoing drops the greyed steps
+        d.undo()
+        d.update(0, "flatten", flatten_strength=0.5)
+        self.assertEqual(d.history()[2], [])
+        self.assertEqual(d.history()[1][-1], "Flatten · page 1")
+        d.jump(base)
+        self.app.processEvents()
+
     def test_6_export_matches_cli_project(self):
         from sheetfit.cli import main
         self.doc.update(1, "size", scale_adjust=0.9, offset_in=[0.2, 0.5])

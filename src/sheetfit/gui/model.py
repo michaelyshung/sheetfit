@@ -8,7 +8,9 @@ Slow work (analysing photos, re-cleaning, export) runs on a thread pool.
 from __future__ import annotations
 
 import copy
+import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -34,6 +36,15 @@ from ..warp import apply_guides
 
 PREVIEW_PX = 1600
 STEPS = ["clean", "straighten", "flatten", "crop", "size", "contrast", "output"]
+STEP_NAMES = {"clean": "Clean", "straighten": "Straighten", "flatten": "Flatten",
+              "crop": "Crop", "size": "Size and position", "contrast": "Contrast",
+              "output": "Output"}
+SETTING_NAMES = {"white_point": "Clean background", "darken": "Darken lines",
+                 "bw": "Black and white", "bw_threshold": "Black and white",
+                 "paper": "Paper size", "margin": "Margins", "orientation": "Orientation",
+                 "align": "Placement", "uniform_scale": "Same staff size",
+                 "keep_color_marks": "Coloured markings", "flatten_lighting": "Even out lighting",
+                 "clean_edges": "Page edges", "dpi": "Resolution", "non_music": "Non-music pages"}
 
 
 def _preview_of(src: Source) -> tuple[Source, float]:
@@ -117,6 +128,7 @@ class Document(QObject):
     pages_changed = Signal()         # pages added, removed or reordered
     settings_changed = Signal()
     busy = Signal(str)               # status text ("" when idle)
+    history_changed = Signal()       # undo/redo availability changed
 
     def __init__(self):
         super().__init__()
@@ -125,6 +137,13 @@ class Document(QObject):
         self.path: Path | None = None
         self.dirty = False
         self.pool = QThreadPool.globalInstance()
+        self._undo: list[tuple] = []
+        self._redo: list[tuple] = []
+        self._last_tag = None
+        self._last_time = 0.0
+        self._quiet_history = 0
+        self._jumping = False
+        self._origin = "Start"
         self._jobs = 0
         self._token = 0
         self._callbacks: dict[int, tuple] = {}
@@ -170,8 +189,121 @@ class Document(QObject):
     def working(self) -> bool:
         return self._jobs > 0
 
+    # ---- undo / redo
+    HISTORY_LIMIT = 100
+    RECLEAN_KEYS = ("keep_color_marks", "flatten_lighting", "clean_edges")
+
+    def _snapshot(self) -> tuple:
+        return ([(st, copy.deepcopy(st.recipe)) for st in self.pages],
+                copy.deepcopy(self.settings))
+
+    def record(self, tag=None, label: str = "Edit") -> None:
+        """Save the current state before a change named `label`. Repeated
+        changes with the same tag in quick succession (a slider drag) count
+        as one step."""
+        if self._quiet_history:
+            return
+        now = time.monotonic()
+        if tag is not None and tag == self._last_tag and now - self._last_time < 1.5:
+            self._last_time = now
+            return
+        self._undo.append((self._snapshot(), label))
+        del self._undo[:-self.HISTORY_LIMIT]
+        self._redo.clear()
+        self._last_tag, self._last_time = tag, now
+        self.history_changed.emit()
+
+    @contextmanager
+    def batch(self, label: str = "Edit", tag=None):
+        """Several changes that undo as one step."""
+        self.record(tag, label)
+        self._quiet_history += 1
+        try:
+            yield
+        finally:
+            self._quiet_history -= 1
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self._undo)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self._redo)
+
+    def undo(self) -> None:
+        if self._undo:
+            snap, label = self._undo.pop()
+            self._redo.append((self._snapshot(), label))
+            self._restore(snap)
+
+    def redo(self) -> None:
+        if self._redo:
+            snap, label = self._redo.pop()
+            self._undo.append((self._snapshot(), label))
+            self._restore(snap)
+
+    def history(self) -> tuple[str, list[str], list[str]]:
+        """(name of the starting state, steps done oldest first, steps undone
+        in the order they'd be redone)."""
+        return (self._origin, [lb for _, lb in self._undo], [lb for _, lb in reversed(self._redo)])
+
+    def jump(self, k: int) -> None:
+        """Go to the state after the first k steps (0 = the starting state)."""
+        if k == len(self._undo):
+            return
+        self._jumping = True
+        try:
+            while len(self._undo) > k and self._undo:
+                self.undo()
+            while len(self._undo) < k and self._redo:
+                self.redo()
+        finally:
+            self._jumping = False
+        self.settings_changed.emit()
+        self.pages_changed.emit()
+        self.history_changed.emit()
+
+    def _restore(self, snap) -> None:
+        pages, settings = snap
+        old_pages = list(self.pages)
+        old = self.settings
+        reclean = any(getattr(old, k) != getattr(settings, k) for k in self.RECLEAN_KEYS)
+        settings_changed = old != settings
+        self.project.settings = copy.deepcopy(settings)
+        changed = []
+        for st, r in pages:
+            if st.recipe != r:
+                st.recipe = copy.deepcopy(r)
+                st.cache.clear()
+                changed.append(st)
+                if st.preview is not None and st.preview.rotate90 != r.rotate90 % 4:
+                    self._load_preview(st)   # a 90-degree turn was undone
+            st.status = (("photo" if st.recipe.kind == "photo" else "ready")
+                         if st.recipe.include else "skipped") if st.preview is not None else st.status
+        self.pages = [st for st, _ in pages]
+        self._sync()
+        self.dirty = True
+        self._last_tag = None                # the next edit starts a new step
+        if settings_changed:
+            for st in self.pages:
+                st.invalidate("clean" if reclean else "contrast")
+                if reclean:
+                    self._load_preview(st)
+        if self._jumping:                    # jump() signals once at the end
+            return
+        if settings_changed:
+            self.settings_changed.emit()
+        if [id(p) for p in old_pages] != [id(p) for p in self.pages]:
+            self.pages_changed.emit()
+        else:
+            for st in (self.pages if settings_changed else changed):
+                self.page_changed.emit(self.pages.index(st))
+        self.history_changed.emit()
+
     # ---- adding and analysing
     def add_files(self, paths: list[str]) -> None:
+        self.record(label=f"Add {len(paths)} photo{'s' if len(paths) != 1 else ''}")
         for p in paths:
             st = PageState(PageRecipe(source=str(Path(p).resolve())))
             self.pages.append(st)
@@ -202,6 +334,8 @@ class Document(QObject):
         self._run(_analyze_job, (st.recipe.source, self.settings, rot), done, failed)
 
     def reanalyze(self, i: int, rotate90: int | None = None) -> None:
+        self.record(label=f"Turn page {i + 1}" if rotate90 is not None
+                    else f"Redo page {i + 1} automatically")
         self._analyze(self.pages[i], rotate90)
 
     def _emit_page(self, st: PageState) -> None:
@@ -209,12 +343,14 @@ class Document(QObject):
             self.page_changed.emit(self.pages.index(st))
 
     def remove(self, i: int) -> None:
+        self.record(label=f"Remove page {i + 1}")
         del self.pages[i]
         self._sync()
         self.dirty = True
         self.pages_changed.emit()
 
     def move(self, i: int, j: int) -> None:
+        self.record(label=f"Move page {i + 1} to {j + 1}")
         st = self.pages.pop(i)
         self.pages.insert(j, st)
         self._sync()
@@ -225,6 +361,10 @@ class Document(QObject):
     def open_project(self, path: str) -> None:
         self.project = Project.load(path)
         self.path = Path(path)
+        self._undo.clear()
+        self._redo.clear()
+        self._origin = f"Opened {self.path.name}"
+        self.history_changed.emit()
         self.pages = [PageState(r) for r in self.project.pages]
         for st in self.pages:
             self._load_preview(st)
@@ -258,6 +398,11 @@ class Document(QObject):
     def update(self, i: int, step: str, **changes) -> None:
         """Change recipe fields for page i, made by hand in editor `step`."""
         st = self.pages[i]
+        if "include" in changes:
+            label = f"{'Include' if changes['include'] else 'Leave out'} page {i + 1}"
+        else:
+            label = f"{STEP_NAMES.get(step, step)} · page {i + 1}"
+        self.record(("update", id(st), step, tuple(sorted(changes))), label)
         for k, v in changes.items():
             setattr(st.recipe, k, v)
         if step not in st.recipe.edited:
@@ -271,6 +416,10 @@ class Document(QObject):
         st = self.pages[i]
         if st.preview is None:
             return
+        with self.batch(f"Auto {STEP_NAMES.get(step, step).lower()} · page {i + 1}"):
+            self._reset_step(i, st, step)
+
+    def _reset_step(self, i: int, st: PageState, step: str) -> None:
         f = st.f
         if step == "straighten":
             angle = find_skew(st.preview.clean, self.settings.max_angle)
@@ -290,6 +439,8 @@ class Document(QObject):
         self.page_changed.emit(i)
 
     def set_settings(self, reclean: bool = False, **changes) -> None:
+        names = sorted({SETTING_NAMES.get(k, k) for k in changes})
+        self.record(("settings", tuple(sorted(changes))), ", ".join(names))
         self.project.settings = replace(self.settings, **changes)
         self.dirty = True
         for st in self.pages:

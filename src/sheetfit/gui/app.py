@@ -134,6 +134,53 @@ class PageStrip(QListWidget):
             self.doc.remove(i)
 
 
+class HistoryPanel(QWidget):
+    """Every step since the start, oldest at the top. The current state is
+    highlighted; undone steps are greyed below it until a new edit replaces
+    them. Click a row to go back (or forward) to that state."""
+
+    def __init__(self, doc: Document):
+        super().__init__()
+        self.doc = doc
+        self.setFixedWidth(210)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 6, 10)
+        t = QLabel("History")
+        t.setStyleSheet("font-weight: 500;")
+        lay.addWidget(t)
+        self.list = QListWidget()
+        self.list.setFrameShape(QFrame.NoFrame)
+        self.list.setWordWrap(True)
+        self.list.itemClicked.connect(lambda it: self.doc.jump(self.list.row(it)))
+        lay.addWidget(self.list, 1)
+        hint = QLabel("Click a step to go back to it.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: palette(placeholder-text); font-size: 11px;")
+        lay.addWidget(hint)
+        doc.history_changed.connect(self.refresh)
+        self.refresh()
+
+    def refresh(self):
+        origin, done, undone = self.doc.history()
+        self.list.blockSignals(True)
+        self.list.clear()
+        for k, text in enumerate([origin] + done + undone):
+            it = QListWidgetItem(text)
+            if k > len(done):  # undone: can still be redone
+                f = it.font()
+                f.setItalic(True)
+                it.setFont(f)
+                it.setForeground(self.palette().placeholderText())
+            self.list.addItem(it)
+        cur = self.list.item(len(done))
+        cur.setSelected(True)
+        f = cur.font()
+        f.setBold(True)
+        cur.setFont(f)
+        self.list.scrollToItem(cur)
+        self.list.blockSignals(False)
+
+
 class EmptyState(QWidget):
     def __init__(self, on_add):
         super().__init__()
@@ -160,7 +207,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.doc = doc or Document()
         self.setWindowTitle("sheetfit")
-        self.resize(1280, 860)
+        self.resize(1440, 880)
         self.setAcceptDrops(True)
 
         central = QWidget()
@@ -180,6 +227,13 @@ class MainWindow(QMainWindow):
             self.step_group.addButton(b, k)
             th.addWidget(b)
         th.addStretch(1)
+        self.undo_btn = self._btn("↶ Undo", self.doc.undo)
+        self.redo_btn = self._btn("↷ Redo", self.doc.redo)
+        self.undo_btn.setToolTip("Undo (Ctrl+Z)")
+        self.redo_btn.setToolTip("Redo (Ctrl+Shift+Z or Ctrl+Y)")
+        th.addWidget(self.undo_btn)
+        th.addWidget(self.redo_btn)
+        th.addSpacing(12)
         for text, fn in (("Add photos…", self.add_photos), ("Open…", self.open_project),
                          ("Save", self.save_project)):
             th.addWidget(self._btn(text, fn))
@@ -192,7 +246,18 @@ class MainWindow(QMainWindow):
         self.editors = [E(self.doc) for E in EDITORS]
         for e in self.editors:
             self.stack.addWidget(e)
-        v.addWidget(self.stack, 1)
+        mid = QWidget()
+        mh = QHBoxLayout(mid)
+        mh.setContentsMargins(0, 0, 0, 0)
+        mh.setSpacing(0)
+        self.history = HistoryPanel(self.doc)
+        mh.addWidget(self.history)
+        vl = QFrame()
+        vl.setFrameShape(QFrame.VLine)
+        vl.setStyleSheet("color: palette(mid);")
+        mh.addWidget(vl)
+        mh.addWidget(self.stack, 1)
+        v.addWidget(mid, 1)
         v.addWidget(_hline())
         self.strip = PageStrip(self.doc)
         v.addWidget(self.strip)
@@ -206,8 +271,14 @@ class MainWindow(QMainWindow):
         self.doc.pages_changed.connect(self._pages_changed)
         self.doc.page_changed.connect(self._page_changed)
         self.doc.busy.connect(self.busy.setText)
+        self.doc.history_changed.connect(self._history)
+        self._history()
 
-        for text, key, fn in (("Add photos", QKeySequence.Open, self.add_photos),
+        for text, key, fn in (("Undo", QKeySequence.Undo, self.doc.undo),
+                              ("Redo", QKeySequence.Redo, self.doc.redo),
+                              ("Redo", QKeySequence("Ctrl+Shift+Z"), self.doc.redo),
+                              ("Redo", QKeySequence("Ctrl+Y"), self.doc.redo),
+                              ("Add photos", QKeySequence.Open, self.add_photos),
                               ("Save project", QKeySequence.Save, self.save_project),
                               ("Save project as", QKeySequence.SaveAs, lambda: self.save_project(True)),
                               ("Print", QKeySequence.Print, self.print_pages),
@@ -263,6 +334,11 @@ class MainWindow(QMainWindow):
         for i in sorted(self._stale):
             self.strip.update_page(i)
         self._stale.clear()
+
+    def _history(self):
+        self.undo_btn.setEnabled(self.doc.can_undo)
+        self.redo_btn.setEnabled(self.doc.can_redo)
+        self._title()
 
     def _title(self):
         name = self.doc.path.name if self.doc.path else "Untitled"
