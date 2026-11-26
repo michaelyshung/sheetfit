@@ -54,8 +54,8 @@ pip install git+https://github.com/michaelyshung/sheetfit            # command l
 pip install "sheetfit[gui] @ git+https://github.com/michaelyshung/sheetfit"   # plus the app
 ```
 
-The command-line version stays lightweight (numpy, Pillow, pillow-heif);
-the app adds PySide6. On Linux the app also needs one system library that
+The command-line version stays lightweight (numpy, Pillow, pillow-heif) and
+runs on Python 3.10+; the app adds PySide6 and needs Python 3.12+. On Linux the app also needs one system library that
 Qt doesn't bundle:
 
 ```bash
