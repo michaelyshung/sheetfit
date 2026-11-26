@@ -383,7 +383,15 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) > 1:
         QTimer.singleShot(0, lambda: win.add_paths(argv[1:]))
     win.show()
-    return app.exec()
+    rc = app.exec()
+    # Destroy Qt objects before Python shuts down (avoids a crash on exit
+    # with Python < 3.12).
+    from PySide6.QtCore import QThreadPool
+    QThreadPool.globalInstance().waitForDone()
+    win.deleteLater()
+    app.processEvents()
+    del win
+    return rc
 
 
 if __name__ == "__main__":
