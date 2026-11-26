@@ -391,6 +391,7 @@ class _GuidePath(QGraphicsPathItem):
     def __init__(self, editor, gi: int, hit: float):
         super().__init__()
         self.editor, self.gi, self.hit = editor, gi, hit
+        self.interactive = True  # takes clicks; the canvas doesn't pan here
         self.setCursor(Qt.PointingHandCursor)
         self.setZValue(5)
 

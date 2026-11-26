@@ -48,6 +48,9 @@ with the automatic result; change only what needs it:
 Every editor shows the finished page on paper beside it, and has an **Auto**
 button to redo that step automatically. All sliders apply as you drag.
 
+Scroll to zoom, drag to pan (or Space + drag anywhere, even over the page in
+Size and position), double-click to fit the page again.
+
 The **History** panel on the left lists every change, like Photoshop's:
 click any step to go back to it (or forward again). Undo and redo are also
 on Ctrl+Z and Ctrl+Shift+Z / Ctrl+Y.

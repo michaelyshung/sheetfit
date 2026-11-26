@@ -25,6 +25,28 @@ from test_pipeline import curl, music_page
 from sheetfit.core import flatten_lighting, to_gray
 
 
+def mouse(view, kind, pos, button=None, buttons=None):
+    """Send a real mouse event to a canvas viewport at widget pos (x, y)."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    button = button or Qt.LeftButton
+    if buttons is None:
+        buttons = Qt.NoButton if kind == "release" else button
+    t = {"press": QEvent.MouseButtonPress, "move": QEvent.MouseMove,
+         "release": QEvent.MouseButtonRelease, "double": QEvent.MouseButtonDblClick}[kind]
+    p = QPointF(*pos)
+    ev = QMouseEvent(t, p, view.viewport().mapToGlobal(p), button if kind != "move" else Qt.NoButton,
+                     buttons, Qt.NoModifier)
+    QApplication.sendEvent(view.viewport(), ev)
+
+
+def drag(view, a, b, steps=6):
+    mouse(view, "press", a)
+    for k in range(1, steps + 1):
+        mouse(view, "move", (a[0] + (b[0] - a[0]) * k / steps, a[1] + (b[1] - a[1]) * k / steps))
+    mouse(view, "release", b)
+
+
 def wait(app, doc, timeout=60):
     t = time.time()
     while doc.working and time.time() - t < timeout:
@@ -317,6 +339,80 @@ class TestApp(unittest.TestCase):
         self.assertEqual(d.history()[2], [])
         self.assertEqual(d.history()[1][-1], "Flatten · page 1")
         d.jump(base)
+        self.app.processEvents()
+
+    def test_9_drag_pans_everywhere(self):
+        for step in ("clean", "straighten", "flatten", "crop", "size", "contrast", "output"):
+            ed = self.editor(step)
+            views = [ed.canvas] + ([ed.result_view] if ed.has_preview else [])
+            for v in views:
+                v.resize(600, 500)
+                v.fit()
+                v.scale(4, 4)               # zoom in so there's room to pan
+                v._fit = False
+                self.app.processEvents()
+                hs, vs = v.horizontalScrollBar(), v.verticalScrollBar()
+                hs.setValue((hs.minimum() + hs.maximum()) // 2)
+                vs.setValue((vs.minimum() + vs.maximum()) // 2)
+                h0, v0 = hs.value(), vs.value()
+                # start on a spot with no handle under it; if the movable page
+                # fills the view (Size, zoomed in), hold Space like in Photoshop
+                spots = [p for p in ((30, 30), (570, 30), (30, 470), (570, 470), (300, 30))
+                         if not v._interactive(p)]
+                v._space = not spots
+                start = spots[0] if spots else (300, 250)
+                drag(v, start, (start[0] + 80, start[1] + 60))
+                v._space = False
+                self.app.processEvents()
+                self.assertEqual((hs.value(), vs.value()), (h0 - 80, v0 - 60), step)
+
+    def test_9b_click_handle_and_double_click_still_work(self):
+        from PySide6.QtCore import QPointF
+        ed = self.editor("flatten")
+        st = self.doc.pages[0]
+        n = len(st.recipe.guides)
+        ed.canvas.fit()
+        self.app.processEvents()
+        # a click (no drag) on empty page with "+ Line" adds a line
+        ed.add.setChecked(True)
+        spot = next(p for p in ((200, 40), (200, 20), (300, 60)) if not ed.canvas._interactive(p))
+        mouse(ed.canvas, "press", spot)
+        mouse(ed.canvas, "release", spot)
+        self.app.processEvents()
+        self.assertEqual(len(st.recipe.guides), n + 1)
+        self.doc.undo()
+        self.app.processEvents()
+        # a real double-click on a guide line adds an anchor
+        ed.select(0, None)
+        self.app.processEvents()
+        k = len(st.recipe.guides[0].anchor_strengths)
+        g = np.asarray(st.recipe.guides[0].points)
+        from sheetfit.gui.canvas import Handle
+        at = None
+        for p in g[2:-2]:           # a spot on the line, clear of its handles
+            vp = ed.canvas.mapFromScene(ed.to_scene(ed.img, *p))
+            if not any(isinstance(it, Handle) for it in ed.canvas.items(vp)):
+                at = (vp.x(), vp.y())
+                break
+        self.assertIsNotNone(at)
+        for kind in ("press", "release", "double", "release"):
+            mouse(ed.canvas, kind, at)
+        self.app.processEvents()
+        self.assertEqual(len(st.recipe.guides[0].anchor_strengths), k + 1)
+        self.doc.undo()
+        self.app.processEvents()
+        # dragging a handle moves it (doesn't pan)
+        ed.select(0, None)
+        self.app.processEvents()
+        h, kk = [(h, kk) for h, kk in ed.handles if kk % 3 == 0][-1]
+        hp = ed.canvas.mapFromScene(h.pos())
+        hs = ed.canvas.horizontalScrollBar().value()
+        y0 = st.recipe.guides[0].bezier[-1][1]
+        drag(ed.canvas, (hp.x(), hp.y()), (hp.x(), hp.y() + 15))
+        self.app.processEvents()
+        self.assertEqual(ed.canvas.horizontalScrollBar().value(), hs)
+        self.assertGreater(st.recipe.guides[0].bezier[-1][1], y0)
+        self.doc.undo()
         self.app.processEvents()
 
     def test_6_export_matches_cli_project(self):

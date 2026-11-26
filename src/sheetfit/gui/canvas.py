@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsItem,
@@ -88,8 +88,9 @@ class Handle(QGraphicsPathItem):
 class Canvas(QGraphicsView):
     """Shows one image; editors add overlay items to `scene()`.
 
-    Scroll wheel zooms, middle-drag (or space+drag) pans. `clicked_empty`
-    fires with scene coordinates when the user clicks off any item.
+    Scroll wheel zooms; dragging anywhere that isn't a handle pans, and so
+    does Space + drag or middle-button drag anywhere; double-click fits. `clicked_empty` fires
+    with scene coordinates on a click (no drag) off any handle.
     """
     clicked_empty = Signal(QPointF)
 
@@ -106,6 +107,10 @@ class Canvas(QGraphicsView):
         self.scene().addItem(self.pix)
         self._fit = True
         self._pan = None
+        self._press = None
+        self._space = False
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.viewport().setCursor(Qt.OpenHandCursor)  # items set their own cursors
 
     def set_image(self, img: Image.Image | None, keep_view: bool = False) -> None:
         if img is None:
@@ -137,36 +142,92 @@ class Canvas(QGraphicsView):
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
         self.scale(f, f)
 
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MiddleButton:
-            self._pan = e.position()
-            self.setCursor(Qt.ClosedHandCursor)
+    DRAG_PX = 4
+
+    @staticmethod
+    def _takes_mouse(item) -> bool:
+        while item is not None:
+            if getattr(item, "interactive", False) or item.flags() & (
+                    QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable):
+                return True
+            item = item.parentItem()
+        return False
+
+    def _interactive(self, at) -> bool:
+        """Is there a handle, guide line or movable page under view point `at`?
+        The image and decorations (grid, shading, outlines, handle lines)
+        don't take the mouse, so dragging on them pans."""
+        if not isinstance(at, QPoint):
+            at = QPoint(int(at[0]), int(at[1])) if isinstance(at, tuple) else None
+        if at is None:
+            return False
+        return any(self._takes_mouse(it) for it in self.items(at))
+
+    def _start_pan(self, pos: QPointF) -> None:
+        # pan by the total distance from here, so no rounding drift
+        self._pan = pos
+        self._pan_from = (self.horizontalScrollBar().value(), self.verticalScrollBar().value())
+        self._fit = False
+        self.viewport().setCursor(Qt.ClosedHandCursor)
+
+    # Space + drag pans anywhere (even over handles or the movable page)
+    def enterEvent(self, e):
+        super().enterEvent(e)
+        self.setFocus(Qt.MouseFocusReason)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Space and not e.isAutoRepeat():
+            self._space = True
+            self.viewport().setCursor(Qt.OpenHandCursor)
             return
-        item = self.itemAt(e.position().toPoint())
-        if e.button() == Qt.LeftButton and (item is None or item is self.pix):
-            self.scene().clearSelection()
-            self.clicked_empty.emit(self.mapToScene(e.position().toPoint()))
+        super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        if e.key() == Qt.Key_Space and not e.isAutoRepeat():
+            self._space = False
+            return
+        super().keyReleaseEvent(e)
+
+    def mousePressEvent(self, e):
+        pos = e.position()
+        if e.button() == Qt.MiddleButton or (e.button() == Qt.LeftButton and self._space):
+            self._start_pan(pos)
+            return
+        if e.button() == Qt.LeftButton and not self._interactive(pos.toPoint()):
+            self._press = pos  # a click or a pan: decided when the mouse moves
+            return
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        pos = e.position()
+        if self._press is not None and self._pan is None and \
+                (pos - self._press).manhattanLength() > self.DRAG_PX:
+            self._start_pan(self._press)
         if self._pan is not None:
-            d = e.position() - self._pan
-            self._pan = e.position()
-            self._fit = False
-            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(d.x()))
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(d.y()))
+            d = pos - self._pan
+            self.horizontalScrollBar().setValue(self._pan_from[0] - round(d.x()))
+            self.verticalScrollBar().setValue(self._pan_from[1] - round(d.y()))
             return
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MiddleButton:
-            self._pan = None
-            self.unsetCursor()
+        if self._pan is not None or self._press is not None:
+            click = self._pan is None and e.button() == Qt.LeftButton
+            press = self._press
+            self._pan = self._press = None
+            self.viewport().setCursor(Qt.OpenHandCursor)
+            if click:
+                self.scene().clearSelection()
+                self.clicked_empty.emit(self.mapToScene(press.toPoint()))
             return
         super().mouseReleaseEvent(e)
 
     def mouseDoubleClickEvent(self, e):
-        self.fit()
+        # double-click a guide line adds an anchor; anywhere else fits the page
+        if self._interactive(e.position().toPoint()):
+            super().mouseDoubleClickEvent(e)
+        else:
+            self.fit()
 
 
 def dashed(color: QColor, width: float = 1.5) -> QPen:
