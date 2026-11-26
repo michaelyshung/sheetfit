@@ -54,8 +54,16 @@ class TestApp(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Tear Qt down while Python is still fully alive: on Python < 3.12,
+        # PySide objects destroyed during interpreter shutdown can crash it.
+        from PySide6.QtCore import QThreadPool
         cls.win.doc.dirty = False
+        QThreadPool.globalInstance().waitForDone()
         cls.win.close()
+        cls.win.deleteLater()
+        cls.app.processEvents()
+        del cls.win, cls.doc
+        cls.app.processEvents()
         cls.td.cleanup()
 
     def editor(self, step: str, page: int = 0):
