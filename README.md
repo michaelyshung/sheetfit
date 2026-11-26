@@ -4,9 +4,13 @@
 
 Turn phone photos of sheet music into clean, straight, print-ready pages.
 
-![A phone photo of a curled book page (left) and the straightened, cleaned Letter page sheetfit makes from it (right)](docs/example_waltz.png)
+![A photo of a curled book page (left) and the straightened, cleaned Letter page sheetfit makes from it (right)](docs/example_page1.png)
 
-*Real example: a phone photo of a page from a bound book, and the output.*
+*The music and the "photo" are generated (an original, randomly composed
+page, engraved and given book curl, tilt, shadows and a table by
+[scripts/make_examples.py](scripts/make_examples.py)), so no copyrighted score
+is reproduced here. The output on the right is the real, unedited sheetfit
+pipeline run on that photo.*
 
 `sheetfit` takes photos or scans of sheet music (including pages photographed
 straight out of a bound book) and produces a multi-page PDF where every page is:
@@ -30,6 +34,8 @@ It is a single command, works on a whole folder at once, and only depends on
 ## The app
 
 ![sheetfit app: flatten editor](docs/app_flatten.png)
+
+*The app on the same generated pages.*
 
 `sheetfit-app` opens a window with one editor per step. Every page starts
 with the automatic result; change only what needs it:
@@ -176,6 +182,11 @@ python -m unittest discover tests      # or: pytest
 
 Tests build synthetic sheet-music photos (tilted, curled, on a table, with
 coloured paper) and check every step plus the CLI end to end.
+
+The README images are made with `python scripts/make_examples.py`: it
+engraves original pages, "photographs" them, runs the real `sheetfit`
+command on them and takes the app screenshot (needs `sheetfit[gui]` for the
+screenshot and the Noto Music font for clefs).
 
 ## Personal use
 
