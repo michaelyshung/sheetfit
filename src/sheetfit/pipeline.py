@@ -115,17 +115,28 @@ def analyze(path: str | Path, settings: Settings, rotate90: int = 0,
             return r, None, src
         return r, render(r, settings, src), src
 
-    # flatten guides, measured on the crop, stored in the straightened frame
-    guides = auto_guides(content)
-    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-    r.guides = _shift_guides(guides, cx - straight.width / 2, cy - straight.height / 2)
-
+    r.guides = auto_flatten_guides(straight, box)
     flat, _ = apply_guides(straight, r.guides)
-    fbox = find_content_box(flat)
-    r.crop = box_to_rel(fbox, flat.size)
-    final = flat.crop(fbox)
+    r.crop = auto_crop(flat)
+    final = flat.crop(box_to_abs(r.crop, flat.size))
     r.staff_spacing = staff_spacing(final) or spacing
     return r, _contrast(final, settings), src
+
+
+def auto_flatten_guides(straight: Image.Image, box=None) -> list:
+    """Automatic guides for a straightened page, in its centre-relative frame.
+
+    Measured on the content box (found if not given), where the staves are.
+    """
+    box = box or find_content_box(straight)
+    guides = auto_guides(straight.crop(box))
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return _shift_guides(guides, cx - straight.width / 2, cy - straight.height / 2)
+
+
+def auto_crop(flat: Image.Image) -> list[float]:
+    """Automatic crop box for a flattened page, centre-relative."""
+    return box_to_rel(find_content_box(flat), flat.size)
 
 
 # ---------------------------------------------------------------- render

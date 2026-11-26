@@ -27,13 +27,35 @@ music (a cover, a photo) are kept as plain photos instead of being mangled.
 It is a single command, works on a whole folder at once, and only depends on
 `numpy`, `Pillow` and `pillow-heif` (for iPhone photos).
 
+## The app
+
+![sheetfit app: flatten editor](docs/app_flatten.png)
+
+`sheetfit-app` opens a window with one editor per step. Every page starts
+with the automatic result; change only what needs it:
+
+1. **Clean**: keep or drop coloured markings, lighting and edge cleanup
+2. **Straighten**: angle slider, 90° turns, or drag a guide onto any staff line
+3. **Flatten**: orange guide lines follow each staff; drag points to reshape,
+   set how hard each point is pulled flat, add or delete lines
+4. **Crop**: drag the corners
+5. **Size and position**: drag and resize the music on the paper, with a ghost
+   of the other pages behind it to keep everything lined up
+6. **Contrast**: clean background, darken lines, black and white
+7. **Output**: paper, margins, then save a PDF or print
+
+Every editor has an **Auto** button to undo your changes for that step.
+Projects save as `.sheetfit` files, which the command line can also render.
+
 ## Install
 
 ```bash
-pip install git+https://github.com/michaelyshung/sheetfit
+pip install git+https://github.com/michaelyshung/sheetfit            # command line only
+pip install "sheetfit[gui] @ git+https://github.com/michaelyshung/sheetfit"   # plus the app
 ```
 
-or, from a clone:
+The command-line version stays lightweight (numpy, Pillow, pillow-heif);
+the app adds PySide6. Or, from a clone:
 
 ```bash
 pip install .
@@ -139,6 +161,15 @@ python -m unittest discover tests      # or: pytest
 Tests build synthetic sheet-music photos (tilted, curled, on a table, with
 coloured paper) and check every step plus the CLI end to end.
 
+## Personal use
+
+sheetfit is meant for making clean, printable copies of music **you already
+own or have the right to use**, for your own practice and performance. It
+is not a tool for copying or sharing other people's work. Most published
+sheet music, including editions of public-domain pieces, is protected by
+copyright; scanning and sharing it, publicly or with others, may infringe
+those rights. You are responsible for how you use this tool and its output.
+
 ## License
 
-MIT
+MIT (see [LICENSE](LICENSE)): the software comes with no warranty.

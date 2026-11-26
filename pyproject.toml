@@ -19,8 +19,15 @@ classifiers = [
     "Environment :: Console",
 ]
 
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+test = ["pytest"]
+
 [project.scripts]
 sheetfit = "sheetfit.cli:main"
+
+[project.gui-scripts]
+sheetfit-app = "sheetfit.gui.app:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "sheetfit.__version__" }

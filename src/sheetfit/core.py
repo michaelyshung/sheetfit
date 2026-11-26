@@ -305,19 +305,35 @@ def _page_geometry(img: Image.Image, dpi: int, margin_in: float, orientation: st
     return pw, ph, m, min((pw - 2 * m) / img.width, (ph - 2 * m) / img.height)
 
 
+def place(size: tuple[int, int], dpi: int, margin_in: float, orientation: str,
+          align: str, paper: str = "letter", scale: float | None = None,
+          offset_in: tuple[float, float] = (0.0, 0.0)) -> tuple[int, int, int, int, int, int]:
+    """Where content of `size` lands on the page: (page_w, page_h, x, y, w, h).
+
+    Default: largest size that fits the margins, centred horizontally, top-
+    or centre-aligned. `scale` (output px per content px) and `offset_in`
+    (inches) override size and position. Shared by export and the app's
+    Size editor so they can't disagree.
+    """
+    w_in, h_in = PAPER_IN[paper]
+    pw, ph = round(w_in * dpi), round(h_in * dpi)
+    if orientation == "landscape" or (orientation == "auto" and size[0] > size[1]):
+        pw, ph = ph, pw
+    m = round(margin_in * dpi)
+    if scale is None:
+        scale = min((pw - 2 * m) / size[0], (ph - 2 * m) / size[1])
+    nw, nh = max(1, round(size[0] * scale)), max(1, round(size[1] * scale))
+    x = (pw - nw) // 2 + round(offset_in[0] * dpi)
+    y = (m if align == "top" else (ph - nh) // 2) + round(offset_in[1] * dpi)
+    return pw, ph, x, y, nw, nh
+
+
 def fit_to_page(img: Image.Image, dpi: int, margin_in: float, orientation: str,
                 align: str, paper: str = "letter", scale: float | None = None,
                 offset_in: tuple[float, float] = (0.0, 0.0)) -> Image.Image:
-    """Place `img` on a blank page. Default: largest size that fits the
-    margins, centred horizontally, top- or centre-aligned. `scale` (output
-    px per image px) and `offset_in` (inches) override size and position.
-    """
-    pw, ph, m, fit = _page_geometry(img, dpi, margin_in, orientation, paper)
-    scale = fit if scale is None else scale
-    nw, nh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
-    fitted = img.resize((nw, nh), Image.LANCZOS)
+    """Render `img` onto a blank page at the position `place` gives."""
+    pw, ph, x, y, nw, nh = place(img.size, dpi, margin_in, orientation, align, paper,
+                                 scale, offset_in)
     page = Image.new("L", (pw, ph), 255)
-    x = (pw - nw) // 2 + round(offset_in[0] * dpi)
-    y = (m if align == "top" else (ph - nh) // 2) + round(offset_in[1] * dpi)
-    page.paste(fitted, (x, y))
+    page.paste(img.resize((nw, nh), Image.LANCZOS), (x, y))
     return page
