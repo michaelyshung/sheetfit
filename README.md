@@ -1,5 +1,7 @@
 # sheetfit
 
+[![tests](https://github.com/michaelyshung/sheetfit/actions/workflows/tests.yml/badge.svg)](https://github.com/michaelyshung/sheetfit/actions/workflows/tests.yml)
+
 Turn phone photos of sheet music into clean, straight, print-ready pages.
 
 ![A phone photo of a curled book page (left) and the straightened, cleaned Letter page sheetfit makes from it (right)](docs/example_waltz.png)
@@ -15,10 +17,15 @@ straight out of a bound book) and produces a multi-page PDF where every page is:
   coloured banners, page edges, neighbouring pages and the table are removed
 - **high contrast**: background to pure white, faded/grey notation to black,
   so it prints crisply on a monochrome printer
+- **consistent**: staff lines print at the same size on every page, even if
+  the photos were taken from different distances
 - **fitted** to Letter, A4 or Legal with consistent margins
 
+Page numbers are kept, iPhone HEIC photos work directly, and pages without
+music (a cover, a photo) are kept as plain photos instead of being mangled.
+
 It is a single command, works on a whole folder at once, and only depends on
-`numpy` and `Pillow`.
+`numpy`, `Pillow` and `pillow-heif` (for iPhone photos).
 
 ## Install
 
@@ -55,6 +62,8 @@ Without installing: `python -m sheetfit ...` from the `src/` directory.
 | `--margin IN` | `0.4` | Page margin in inches |
 | `--orientation portrait\|landscape\|auto` | `portrait` | `auto` picks landscape for wide content |
 | `--align top\|center` | `top` | Vertical placement on the page |
+| `--no-uniform-scale` | | Fill each page instead of matching staff size across pages |
+| `--non-music photo\|skip\|music` | `photo` | Pages without staff lines: keep as a plain photo, leave out, or clean like music |
 | `--bw` | off | Pure 1-bit black & white (smallest, sharpest on laser printers) |
 | `--bw-threshold N` | `170` | Cut-off for `--bw` |
 | `--white-point N` | `215` | Grey level at/above which becomes white. Lower = cleaner background |
@@ -86,7 +95,11 @@ Without installing: `python -m sheetfit ...` from the `src/` directory.
    checks skip the step if there's too little music or the fit is poor.
 7. **Contrast for printing.** Levels (darkest ink → black, `--white-point` →
    white) plus a gamma curve that pulls faded lines to black.
-8. **Fit** to the page within the margins and write the PDF/PNGs.
+8. **Same size everywhere.** Measure the staff-line spacing on every page
+   (autocorrelation of the row profile; no clear period = not music). Pick
+   the largest printed staff size at which every page still fits, and scale
+   each page to it.
+9. **Fit** to the page within the margins and write the PDF/PNGs.
 
 ## Tips and limitations
 
@@ -97,8 +110,8 @@ Without installing: `python -m sheetfit ...` from the `src/` directory.
   is also compressed sideways, and that isn't undone.
 - Low-resolution photos are upscaled to fill the page. Notation stays legible,
   but small text gets soft. Use your camera's full resolution.
-- Non-music pages (e.g. a cover photo) are processed too but will look like a
-  high-contrast sketch. Leave them out of the folder if you don't want that.
+- Matching staff size means a page with less music gets more white space
+  rather than being blown up. Use `--no-uniform-scale` to fill every page.
 
 ## Development
 

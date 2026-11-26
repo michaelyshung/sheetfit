@@ -7,19 +7,20 @@ from __future__ import annotations
 import random
 import tempfile
 import unittest
-from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 from sheetfit.core import (
+    HEIF_OK,
     PAPER_IN,
     dewarp,
     find_content_box,
     find_skew,
     flatten_lighting,
     main,
+    staff_spacing,
     to_gray,
     whiten_dark_edges,
 )
@@ -27,8 +28,8 @@ from sheetfit.core import (
 W, H = 1200, 1550
 
 
-def music_page(seed: int = 0, paper=(242, 232, 205)) -> Image.Image:
-    """A fake page: 6 systems of 2 staves with note heads and stems."""
+def music_page(seed: int = 0, paper=(242, 232, 205), page_no: bool = False) -> Image.Image:
+    """A fake page: 6 systems of 2 staves (line gap 14 px) with notes."""
     rnd = random.Random(seed)
     pg = Image.new("RGB", (W, H), paper)
     d = ImageDraw.Draw(pg)
@@ -46,6 +47,20 @@ def music_page(seed: int = 0, paper=(242, 232, 205)) -> Image.Image:
                 d.line([x + 14, yy, x + 14, yy - 45], fill=(40, 40, 40), width=2)
         d.line([110, y, 110, y + 110 + 56], fill=(40, 40, 40), width=3)
         y += 215
+    if page_no:
+        d.rectangle([1050, 1500, 1062, 1518], fill=(30, 30, 30))  # a small "page number"
+    return pg
+
+
+def photo_page(seed: int = 0) -> Image.Image:
+    """A non-music page: smooth blobs and a face-ish shape, no staff lines."""
+    rnd = random.Random(seed)
+    pg = Image.new("RGB", (W, H), (200, 180, 150))
+    d = ImageDraw.Draw(pg)
+    for _ in range(25):
+        x, y, r = rnd.randint(0, W), rnd.randint(0, H), rnd.randint(40, 250)
+        c = tuple(rnd.randint(30, 230) for _ in range(3))
+        d.ellipse([x - r, y - r, x + r, y + r], fill=c)
     return pg
 
 
@@ -106,6 +121,21 @@ class TestSteps(unittest.TestCase):
         self.assertLess(moved, 3)
 
 
+class TestStaffSize(unittest.TestCase):
+    def test_measures_staff_spacing(self):
+        g = flatten_lighting(to_gray(music_page(), False))
+        self.assertAlmostEqual(staff_spacing(g), 14.0, delta=0.5)
+
+    def test_spacing_scales_with_zoom(self):
+        g = flatten_lighting(to_gray(music_page(), False))
+        g2 = g.resize((int(W * 0.7), int(H * 0.7)), Image.LANCZOS)
+        self.assertAlmostEqual(staff_spacing(g2), 14.0 * 0.7, delta=0.5)
+
+    def test_non_music_has_no_spacing(self):
+        g = flatten_lighting(to_gray(photo_page(), False))
+        self.assertIsNone(staff_spacing(g))
+
+
 class TestCLI(unittest.TestCase):
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory() as td:
@@ -131,6 +161,55 @@ class TestCLI(unittest.TestCase):
             with Image.open(next((td / "o").glob("*.png"))) as im:
                 self.assertEqual(im.size, (round(w_in * 100), round(h_in * 100)))
                 self.assertEqual(im.mode, "1")
+
+    def test_same_staff_size_on_every_page(self):
+        """Photos taken from different distances print at the same staff size."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            music_page(seed=1).save(td / "a.png")
+            near = music_page(seed=2)
+            near.resize((int(W * 1.3), int(H * 1.3)), Image.LANCZOS).save(td / "b.png")
+            # c is a small crop, so a plain "fill the page" would enlarge it a lot
+            music_page(seed=3).crop((0, 0, 800, 800)).save(td / "c.png")
+            main([str(td), "--png-dir", str(td / "o"), "--dpi", "150"])
+            sizes = []
+            for f in sorted((td / "o").glob("*.png")):
+                with Image.open(f) as im:
+                    sizes.append(staff_spacing(im.convert("L")))
+            self.assertEqual(len(sizes), 3)
+            self.assertLess(max(sizes) / min(sizes), 1.03)
+
+    def test_page_number_kept(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            music_page(page_no=True).save(td / "p.png")
+            main([str(td / "p.png"), "--png-dir", str(td / "o"), "--dpi", "100"])
+            with Image.open(next((td / "o").glob("*.png"))) as im:
+                a = np.asarray(im.convert("L"))
+            rows = np.flatnonzero((a < 100).any(axis=1))
+            # the page number sits ~60 px (at 100 dpi) below the last staff
+            last_staff = np.flatnonzero((a < 100).mean(axis=1) > 0.3).max()
+            self.assertGreater(rows.max() - last_staff, 25)
+
+    def test_non_music_photo_and_skip(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            photo_page().save(td / "0cover.png")
+            music_page().save(td / "1music.png")
+            main([str(td / "0cover.png"), str(td / "1music.png"), "--png-dir", str(td / "keep"), "--dpi", "80"])
+            self.assertEqual(len(list((td / "keep").glob("*.png"))), 2)
+            main([str(td / "0cover.png"), str(td / "1music.png"), "--png-dir", str(td / "skip"),
+                  "--dpi", "80", "--non-music", "skip"])
+            self.assertEqual([f.name for f in (td / "skip").glob("*.png")], ["001_1music.png"])
+
+    @unittest.skipUnless(HEIF_OK, "pillow-heif not installed")
+    def test_heic_input(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            music_page().save(td / "p.heic", quality=90)
+            rc = main([str(td), "-o", str(td / "o.pdf"), "--dpi", "80"])
+            self.assertEqual(rc, 0)
+            self.assertTrue((td / "o.pdf").exists())
 
 
 if __name__ == "__main__":
