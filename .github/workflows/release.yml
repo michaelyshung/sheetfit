@@ -95,11 +95,16 @@ jobs:
         if: matrix.kind == 'deb'
         run: |
           sudo apt-get install -y ./dist/*.deb
-          sheetfit --version
-          sheetfit smoke.png -o installed.pdf && test -s installed.pdf
+          # full paths: pip's own sheetfit is also on PATH here
+          /usr/bin/sheetfit --version
+          /usr/bin/sheetfit smoke.png -o installed.pdf && test -s installed.pdf
+          QT_QPA_PLATFORM=offscreen /usr/bin/sheetfit-app smoke.png & pid=$!
+          sleep 10
+          kill -0 $pid || { echo "the installed app quit on its own"; exit 1; }
+          kill $pid || true
           test -f /usr/share/applications/sheetfit.desktop
           sudo apt-get remove -y sheetfit
-          ! command -v sheetfit
+          test ! -e /usr/bin/sheetfit && test ! -e /opt/sheetfit
 
       - name: Test the .dmg
         if: matrix.kind == 'dmg'
