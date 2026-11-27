@@ -62,10 +62,14 @@ jobs:
           python -c "import sys; sys.path.insert(0, 'tests'); from test_pipeline import music_page; music_page().save('smoke.png')"
           "$dir/sheetfit" smoke.png -o smoke.pdf
           test -s smoke.pdf
-          if [ "$RUNNER_OS" = Linux ]; then
-            # the app should start and keep running (exit 124 = killed by timeout)
-            set +e; timeout 10 "$dir/sheetfit-app" smoke.png; rc=$?; set -e
-            [ $rc -eq 124 ] || { echo "app exited with $rc"; exit 1; }
+          # the app should start and still be running 10 s later
+          "$dir/sheetfit-app" smoke.png & pid=$!
+          sleep 10
+          kill -0 $pid || { echo "the app quit on its own"; exit 1; }
+          kill $pid || true
+          if [ "$RUNNER_OS" = macOS ]; then
+            exe=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" dist/sheetfit.app/Contents/Info.plist)
+            [ "$exe" = sheetfit-app ] || { echo "app bundle launches $exe"; exit 1; }
           fi
 
       - name: Package (.deb)
@@ -85,6 +89,51 @@ jobs:
           if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
           & $iscc "/DAppVersion=$v" packaging\sheetfit.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # install what we built, the way a user would, and run it
+      - name: Test the .deb
+        if: matrix.kind == 'deb'
+        run: |
+          sudo apt-get install -y ./dist/*.deb
+          sheetfit --version
+          sheetfit smoke.png -o installed.pdf && test -s installed.pdf
+          test -f /usr/share/applications/sheetfit.desktop
+          sudo apt-get remove -y sheetfit
+          ! command -v sheetfit
+
+      - name: Test the .dmg
+        if: matrix.kind == 'dmg'
+        run: |
+          hdiutil attach dist/*.dmg -mountpoint /tmp/sheetfit-dmg -nobrowse
+          test -L /tmp/sheetfit-dmg/Applications
+          codesign --verify --deep /tmp/sheetfit-dmg/sheetfit.app
+          /tmp/sheetfit-dmg/sheetfit.app/Contents/MacOS/sheetfit smoke.png -o installed.pdf
+          test -s installed.pdf
+          hdiutil detach /tmp/sheetfit-dmg
+
+      - name: Test the Windows installer
+        if: matrix.kind == 'exe'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $setup = Get-ChildItem dist\*-setup.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/CURRENTUSER', '/TASKS=addtopath', '/SUPPRESSMSGBOXES' -Wait
+          $dir = "$env:LOCALAPPDATA\Programs\sheetfit"
+          & "$dir\sheetfit.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$dir\sheetfit.exe" smoke.png -o installed.pdf
+          if (-not (Test-Path installed.pdf)) { exit 1 }
+          $path = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($path -notlike "*$dir*") { Write-Error "not added to PATH"; exit 1 }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\sheetfit.lnk")) {
+            Write-Error "no Start menu entry"; exit 1 }
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
+          # the uninstaller finishes in a copy of itself; wait for it
+          for ($k = 0; $k -lt 30 -and (Test-Path "$dir\sheetfit.exe"); $k++) { Start-Sleep 1 }
+          $path = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($path -like "*$dir*") { Write-Error "uninstall left PATH entry"; exit 1 }
+          if (Test-Path "$dir\sheetfit.exe") { Write-Error "uninstall left files"; exit 1 }
 
       - uses: actions/upload-artifact@v4
         with:

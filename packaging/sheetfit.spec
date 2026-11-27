@@ -51,6 +51,8 @@ if sys.platform == "darwin":
                  bundle_identifier="io.github.michaelyshung.sheetfit",
                  version=__version__,
                  info_plist={
+                     # the app, not the command-line tool, starts on double-click
+                     "CFBundleExecutable": "sheetfit-app",
                      "CFBundleName": "sheetfit",
                      "CFBundleDisplayName": "sheetfit",
                      "CFBundleShortVersionString": __version__,
